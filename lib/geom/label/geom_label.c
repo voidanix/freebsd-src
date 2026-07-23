@@ -129,10 +129,17 @@ label_label(struct gctl_req *req)
 		return;
 	}
 
+	name = gctl_get_ascii(req, "arg1");
+	if (g_provider_is_host_managed(name)) {
+		gctl_error(req, "Cannot write a label to %s: the last sector "
+		    "of a host-managed zoned device cannot hold metadata.",
+		    name);
+		return;
+	}
+
 	/*
 	 * Clear last sector first to spoil all components if device exists.
 	 */
-	name = gctl_get_ascii(req, "arg1");
 	error = g_metadata_clear(name, NULL);
 	if (error != 0) {
 		gctl_error(req, "Can't store metadata on %s: %s.", name,
@@ -180,6 +187,13 @@ label_clear(struct gctl_req *req)
 
 	for (i = 0; i < nargs; i++) {
 		name = gctl_get_ascii(req, "arg%d", i);
+		if (g_provider_is_host_managed(name)) {
+			fprintf(stderr, "Can't clear metadata on %s: the last "
+			    "sector of a host-managed zoned device cannot hold "
+			    "metadata.\n", name);
+			gctl_error(req, "Not fully done.");
+			continue;
+		}
 		error = g_metadata_clear(name, G_LABEL_MAGIC);
 		if (error != 0) {
 			fprintf(stderr, "Can't clear metadata on %s: %s.\n",

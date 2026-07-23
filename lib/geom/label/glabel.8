@@ -22,7 +22,7 @@
 .\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
 .\"
-.Dd April 19, 2024
+.Dd July 23, 2026
 .Dt GLABEL 8
 .Os
 .Sh NAME
@@ -208,6 +208,11 @@ method, where metadata is stored in a provider's last sector.
 The kernel module
 .Pa geom_label.ko
 will be loaded if it is not loaded already.
+Host-managed zoned providers are refused: their last sector normally lies in
+a sequential-write-required zone and cannot hold metadata.
+Use the
+.Dq manual
+method instead.
 .It Cm stop
 Turn off the given label by its
 .Ar name .
@@ -217,6 +222,9 @@ Same as
 .Cm stop .
 .It Cm clear
 Clear metadata on the given devices.
+Host-managed zoned providers are refused for the same reason as
+.Cm label :
+their last sector cannot be rewritten.
 .It Cm dump
 Dump metadata stored on the given devices.
 .It Cm refresh
