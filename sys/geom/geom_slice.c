@@ -184,6 +184,18 @@ g_slice_finish_hot(struct bio *bp)
 	return;
 }
 
+/*
+ * BIO_ZONE commands return their results inside the bio itself, which
+ * g_std_done() does not propagate to the parent.
+ */
+static void
+g_slice_zone_done(struct bio *bp)
+{
+
+	bcopy(&bp->bio_zone, &bp->bio_parent->bio_zone, sizeof(bp->bio_zone));
+	g_std_done(bp);
+}
+
 static void
 g_slice_done(struct bio *bp)
 {
@@ -314,6 +326,24 @@ g_slice_start(struct bio *bp)
 			return;
 		}
 		bp2->bio_done = g_std_done;
+		g_io_request(bp2, cp);
+		break;
+	case BIO_ZONE:
+		/*
+		 * Zone commands carry LBAs of the underlying provider:
+		 * they only make sense on a slice that maps 1:1.
+		 */
+		if (gsl->offset != 0 ||
+		    gsl->length != cp->provider->mediasize) {
+			g_io_deliver(bp, EOPNOTSUPP);
+			return;
+		}
+		bp2 = g_clone_bio(bp);
+		if (bp2 == NULL) {
+			g_io_deliver(bp, ENOMEM);
+			return;
+		}
+		bp2->bio_done = g_slice_zone_done;
 		g_io_request(bp2, cp);
 		break;
 	default:
