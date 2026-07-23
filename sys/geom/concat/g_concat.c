@@ -320,6 +320,204 @@ g_concat_passdown(struct g_concat_softc *sc, struct bio *bp)
 	}
 }
 
+static uint64_t
+g_concat_disk_lba(struct g_concat_softc *sc, struct g_concat_disk *disk)
+{
+
+	return (disk->d_start / sc->sc_provider->sectorsize);
+}
+
+static struct g_concat_disk *
+g_concat_lba_disk(struct g_concat_softc *sc, uint64_t lba)
+{
+	struct g_concat_disk *disk;
+
+	TAILQ_FOREACH(disk, &sc->sc_disks, d_next) {
+		if (lba < (uint64_t)disk->d_end / sc->sc_provider->sectorsize)
+			break;
+	}
+	return (disk);
+}
+
+static void g_concat_zone_report_done(struct bio *bp);
+
+/*
+ * Issue a REPORT ZONES request to one component, reporting into the
+ * original request's entry buffer past what earlier components filled.
+ *
+ * Reports spanning several components are continued from the completion
+ * callback, which chains to the next component.
+ */
+static void
+g_concat_zone_report(struct g_concat_softc *sc, struct bio *bp,
+    struct g_concat_disk *disk, uint64_t start_lba)
+{
+	struct disk_zone_report *prep, *rep;
+	struct bio *cbp;
+
+	prep = &bp->bio_zone.zone_params.report;
+
+	cbp = g_clone_bio(bp);
+	if (cbp == NULL) {
+		if (bp->bio_error == 0)
+			bp->bio_error = ENOMEM;
+		g_io_deliver(bp, bp->bio_error);
+		return;
+	}
+	rep = &cbp->bio_zone.zone_params.report;
+	rep->starting_id = start_lba;
+	rep->entries_filled = 0;
+	rep->entries_available = 0;
+	if (prep->entries != NULL &&
+	    prep->entries_filled < prep->entries_allocated) {
+		rep->entries_allocated = prep->entries_allocated -
+		    prep->entries_filled;
+		rep->entries = prep->entries + prep->entries_filled;
+	} else {
+		/* No room left.  Ask for the number of matching zones only. */
+		rep->entries_allocated = 0;
+		rep->entries = NULL;
+	}
+	cbp->bio_length = (off_t)rep->entries_allocated *
+	    sizeof(struct disk_zone_rep_entry);
+	cbp->bio_done = g_concat_zone_report_done;
+	cbp->bio_caller1 = disk;
+	G_CONCAT_LOGREQ(cbp, "Sending request.");
+	g_io_request(cbp, disk->d_consumer);
+}
+
+static void
+g_concat_zone_report_done(struct bio *bp)
+{
+	struct g_concat_softc *sc;
+	struct g_concat_disk *disk, *next;
+	struct disk_zone_report *prep, *rep;
+	struct bio *pbp;
+	uint64_t start_lba;
+	uint32_t i;
+	int error;
+
+	pbp = bp->bio_parent;
+	sc = pbp->bio_to->geom->softc;
+	disk = bp->bio_caller1;
+	rep = &bp->bio_zone.zone_params.report;
+	prep = &pbp->bio_zone.zone_params.report;
+	error = bp->bio_error;
+	pbp->bio_inbed++;
+
+	if (error != 0) {
+		g_destroy_bio(bp);
+		g_io_deliver(pbp, error);
+		return;
+	}
+
+	/* Translate the entries this component filled into our LBA space. */
+	start_lba = g_concat_disk_lba(sc, disk);
+	for (i = 0; i < rep->entries_filled; i++) {
+		struct disk_zone_rep_entry *entry = &rep->entries[i];
+
+		entry->zone_start_lba += start_lba;
+		if (entry->zone_condition != DISK_ZONE_COND_NOT_WP)
+			entry->write_pointer_lba += start_lba;
+	}
+	prep->entries_filled += rep->entries_filled;
+	prep->entries_available += rep->entries_available;
+	g_destroy_bio(bp);
+
+	/*
+	 * Zoned devices refuse append and removed members stay linked until
+	 * destroy.
+	 */
+	next = TAILQ_NEXT(disk, d_next);
+	if (next != NULL) {
+		if (next->d_consumer == NULL) {
+			g_io_deliver(pbp, ENXIO);
+			return;
+		}
+		g_concat_zone_report(sc, pbp, next, 0);
+		return;
+	}
+
+	prep->header.same = sc->sc_zone_same;
+	prep->header.maximum_lba = pbp->bio_to->mediasize /
+	    pbp->bio_to->sectorsize - 1;
+	g_io_deliver(pbp, 0);
+}
+
+/*
+ * Handle BIO_ZONE commands with concatenations of host-managed components.
+ * Zone boundaries coincide with component boundaries, so every zone maps
+ * to exactly one component.
+ */
+static void
+g_concat_zone(struct g_concat_softc *sc, struct bio *bp)
+{
+	struct disk_zone_args *args;
+	struct disk_zone_report *rep;
+	struct g_concat_disk *disk;
+	struct bio *cbp;
+	uint64_t lbas;
+
+	sx_assert(&sc->sc_disks_lock, SX_LOCKED);
+
+	if (sc->sc_zone_mode != DISK_ZONE_MODE_HOST_MANAGED) {
+		g_io_deliver(bp, EOPNOTSUPP);
+		return;
+	}
+
+	args = &bp->bio_zone;
+	lbas = sc->sc_provider->mediasize / sc->sc_provider->sectorsize;
+
+	switch (args->zone_cmd) {
+	case DISK_ZONE_GET_PARAMS:
+		args->zone_params.disk_params = sc->sc_zone_params;
+		g_io_deliver(bp, 0);
+		return;
+	case DISK_ZONE_OPEN:
+	case DISK_ZONE_CLOSE:
+	case DISK_ZONE_FINISH:
+	case DISK_ZONE_RWP:
+		if ((args->zone_params.rwp.flags &
+		    DISK_ZONE_RWP_FLAG_ALL) != 0) {
+			g_concat_passdown(sc, bp);
+			return;
+		}
+		if (args->zone_params.rwp.id >= lbas) {
+			g_io_deliver(bp, EINVAL);
+			return;
+		}
+		disk = g_concat_lba_disk(sc, args->zone_params.rwp.id);
+		cbp = g_clone_bio(bp);
+		if (cbp == NULL) {
+			g_io_deliver(bp, ENOMEM);
+			return;
+		}
+		cbp->bio_done = g_std_done;
+		cbp->bio_zone.zone_params.rwp.id -=
+		    g_concat_disk_lba(sc, disk);
+		G_CONCAT_LOGREQ(cbp, "Sending request.");
+		g_io_request(cbp, disk->d_consumer);
+		return;
+	case DISK_ZONE_REPORT_ZONES:
+		rep = &args->zone_params.report;
+		rep->entries_filled = 0;
+		rep->entries_available = 0;
+		if (rep->starting_id >= lbas) {
+			rep->header.same = sc->sc_zone_same;
+			rep->header.maximum_lba = lbas - 1;
+			g_io_deliver(bp, 0);
+			return;
+		}
+		disk = g_concat_lba_disk(sc, rep->starting_id);
+		g_concat_zone_report(sc, bp, disk,
+		    rep->starting_id - g_concat_disk_lba(sc, disk));
+		return;
+	default:
+		g_io_deliver(bp, EOPNOTSUPP);
+		return;
+	}
+}
+
 static void
 g_concat_start(struct bio *bp)
 {
@@ -352,6 +550,9 @@ g_concat_start(struct bio *bp)
 	case BIO_SPEEDUP:
 	case BIO_FLUSH:
 		g_concat_passdown(sc, bp);
+		goto end;
+	case BIO_ZONE:
+		g_concat_zone(sc, bp);
 		goto end;
 	case BIO_GETATTR:
 		if (strcmp("GEOM::kerneldump", bp->bio_attribute) == 0) {
@@ -435,7 +636,156 @@ end:
 	sx_sunlock(&sc->sc_disks_lock);
 }
 
-static void
+/*
+ * Query the zone layout of all components and decide whether this device
+ * is a concatenation of host-managed zoned providers.  Zone command LBAs
+ * are rebased but not rescaled, therefore components must share a sector
+ * size and a zone commands cannot be split.  Every zone but the last has
+ * to end on one of its own zone boundaries.
+ *
+ * Requiring one zone length throughout is a simplification to keep the probe to
+ * a single zone descriptor per component; it also keeps the result in the SAME
+ * classes that let consumers compute zone boundaries instead of enumerating
+ * them.
+ */
+static int
+g_concat_zone_probe(struct g_concat_softc *sc)
+{
+	struct disk_zone_args args;
+	struct disk_zone_rep_entry entry;
+	struct disk_zone_disk_params params;
+	struct g_concat_disk *disk, *last;
+	struct g_provider *dp;
+	uint64_t nlbas;
+	uint8_t same;
+	u_int ndisks, nzoned, sectorsize;
+	bool last_differs, types_differ;
+	int error;
+
+	g_topology_assert();
+
+	sc->sc_zone_mode = DISK_ZONE_MODE_NONE;
+	bzero(&params, sizeof(params));
+	ndisks = nzoned = 0;
+	sectorsize = 0;
+	last_differs = types_differ = false;
+	last = TAILQ_LAST(&sc->sc_disks, g_concat_disks);
+	TAILQ_FOREACH(disk, &sc->sc_disks, d_next) {
+		dp = disk->d_consumer->provider;
+		ndisks++;
+
+		error = g_access(disk->d_consumer, 1, 0, 0);
+		if (error != 0) {
+			G_CONCAT_DEBUG(1, "Failed to access disk %s, "
+			    "error %d.", dp->name, error);
+			continue;
+		}
+		bzero(&args, sizeof(args));
+		args.zone_cmd = DISK_ZONE_GET_PARAMS;
+		error = g_io_zonecmd(&args, disk->d_consumer);
+		if (error != 0 || args.zone_params.disk_params.zone_mode !=
+		    DISK_ZONE_MODE_HOST_MANAGED) {
+			(void)g_access(disk->d_consumer, -1, 0, 0);
+			continue;
+		}
+		nzoned++;
+
+		/*
+		 * Merge component parameters conservatively: keep the
+		 * capability flags everyone shares and the smallest zone
+		 * resource limits, as nothing guarantees open zones will spread
+		 * evenly over the components.
+		 */
+		if (nzoned == 1) {
+			params = args.zone_params.disk_params;
+		} else {
+			params.flags &= args.zone_params.disk_params.flags;
+			params.optimal_seq_zones =
+			    MIN(params.optimal_seq_zones,
+			    args.zone_params.disk_params.optimal_seq_zones);
+			params.optimal_nonseq_zones =
+			    MIN(params.optimal_nonseq_zones,
+			    args.zone_params.disk_params.optimal_nonseq_zones);
+			params.max_seq_zones = MIN(params.max_seq_zones,
+			    args.zone_params.disk_params.max_seq_zones);
+		}
+
+		/* The first zone tells the zone length of the component. */
+		bzero(&args, sizeof(args));
+		bzero(&entry, sizeof(entry));
+		args.zone_cmd = DISK_ZONE_REPORT_ZONES;
+		args.zone_params.report.rep_options = DISK_ZONE_REP_ALL;
+		args.zone_params.report.entries_allocated = 1;
+		args.zone_params.report.entries = &entry;
+		error = g_io_zonecmd(&args, disk->d_consumer);
+		(void)g_access(disk->d_consumer, -1, 0, 0);
+		if (error != 0 ||
+		    args.zone_params.report.entries_filled != 1) {
+			printf("GEOM_CONCAT: Cannot read the zone layout "
+			    "of %s.\n", dp->name);
+			return (error != 0 ? error : ENXIO);
+		}
+		same = args.zone_params.report.header.same;
+		nlbas = dp->mediasize / dp->sectorsize;
+
+		if (nzoned == 1) {
+			sc->sc_zone_length = entry.zone_length;
+			sectorsize = dp->sectorsize;
+		} else if (entry.zone_length != sc->sc_zone_length ||
+		    dp->sectorsize != sectorsize) {
+			printf("GEOM_CONCAT: %s: zoned components with "
+			    "different zone layouts cannot be "
+			    "concatenated.\n", sc->sc_name);
+			return (EINVAL);
+		}
+
+		if (disk != last) {
+			if (nlbas % entry.zone_length != 0 ||
+			    (same != DISK_ZONE_SAME_ALL_SAME &&
+			    same != DISK_ZONE_SAME_TYPES_DIFFERENT)) {
+				printf("GEOM_CONCAT: %s: the zones of %s do "
+				    "not line up with the component that "
+				    "follows.\n", sc->sc_name, dp->name);
+				return (EINVAL);
+			}
+		} else if (nlbas % entry.zone_length != 0 ||
+		    same == DISK_ZONE_SAME_LAST_DIFFERENT ||
+		    same == DISK_ZONE_SAME_ALL_DIFFERENT) {
+			last_differs = true;
+		}
+		if (same == DISK_ZONE_SAME_TYPES_DIFFERENT ||
+		    same == DISK_ZONE_SAME_ALL_DIFFERENT)
+			types_differ = true;
+	}
+
+	if (nzoned == 0)
+		return (0);
+	if (nzoned != ndisks) {
+		printf("GEOM_CONCAT: %s: cannot concatenate host-managed "
+		    "zoned with conventional components.\n", sc->sc_name);
+		return (EINVAL);
+	}
+	if (sc->sc_type != G_CONCAT_TYPE_MANUAL) {
+		printf("GEOM_CONCAT: %s: the metadata sector of an automatic "
+		    "device cannot live on host-managed zoned components.\n",
+		    sc->sc_name);
+		return (EINVAL);
+	}
+
+	params.zone_mode = DISK_ZONE_MODE_HOST_MANAGED;
+	sc->sc_zone_params = params;
+	if (types_differ)
+		sc->sc_zone_same = last_differs ?
+		    DISK_ZONE_SAME_ALL_DIFFERENT :
+		    DISK_ZONE_SAME_TYPES_DIFFERENT;
+	else
+		sc->sc_zone_same = last_differs ?
+		    DISK_ZONE_SAME_LAST_DIFFERENT : DISK_ZONE_SAME_ALL_SAME;
+	sc->sc_zone_mode = DISK_ZONE_MODE_HOST_MANAGED;
+	return (0);
+}
+
+static int
 g_concat_check_and_run(struct g_concat_softc *sc)
 {
 	struct g_concat_disk *disk;
@@ -446,7 +796,11 @@ g_concat_check_and_run(struct g_concat_softc *sc)
 
 	g_topology_assert();
 	if (g_concat_nvalid(sc) != sc->sc_ndisks)
-		return;
+		return (0);
+
+	error = g_concat_zone_probe(sc);
+	if (error != 0)
+		return (error);
 
 	pp = g_new_providerf(sc->sc_geom, "concat/%s", sc->sc_name);
 	pp->flags |= G_PF_DIRECT_SEND | G_PF_DIRECT_RECEIVE |
@@ -487,10 +841,23 @@ g_concat_check_and_run(struct g_concat_softc *sc)
 	dp = TAILQ_FIRST(&sc->sc_disks)->d_consumer->provider;
 	pp->stripesize = dp->stripesize;
 	pp->stripeoffset = dp->stripeoffset;
+	if (sc->sc_zone_mode == DISK_ZONE_MODE_HOST_MANAGED) {
+		struct g_consumer *cp;
+
+		/*
+		 * Zone reports spanning several components are chained from
+		 * the completion path.  Forgo direct dispatch so the chain
+		 * runs on the GEOM queues with bounded stack use.
+		 */
+		pp->flags &= ~(G_PF_DIRECT_SEND | G_PF_DIRECT_RECEIVE);
+		LIST_FOREACH(cp, &sc->sc_geom->consumer, consumer)
+			cp->flags &= ~(G_CF_DIRECT_SEND | G_CF_DIRECT_RECEIVE);
+	}
 	sc->sc_provider = pp;
 	g_error_provider(pp, 0);
 
 	G_CONCAT_DEBUG(0, "Device %s activated.", sc->sc_provider->name);
+	return (0);
 }
 
 static int
@@ -608,7 +975,12 @@ g_concat_add_disk(struct g_concat_softc *sc, struct g_provider *pp, u_int no)
 
 	G_CONCAT_DEBUG(0, "Disk %s attached to %s.", pp->name, sc->sc_name);
 
-	g_concat_check_and_run(sc);
+	error = g_concat_check_and_run(sc);
+	if (error != 0) {
+		disk->d_consumer = NULL;
+		cp->private = NULL;
+		goto fail;
+	}
 	sx_sunlock(&sc->sc_disks_lock); // need lock for check_and_run
 
 	return (0);
@@ -1097,6 +1469,17 @@ g_concat_ctl_append(struct gctl_req *req, struct g_class *mp)
 		gctl_error(req, "Device not active, can't append: %s.", cname);
 		return;
 	}
+	if (sc->sc_zone_mode == DISK_ZONE_MODE_HOST_MANAGED) {
+		/*
+		 * Appending would renumber the zones past the old end of
+		 * the device under any consumer relying on the layout.
+		 *
+		 * A report walking the component list without sc_disks_lock
+		 * would race with the list growing under it.
+		 */
+		gctl_error(req, "Can't append to zoned device: %s.", cname);
+		return;
+	}
 	G_CONCAT_DEBUG(1, "Appending to %s:", cname);
 	sx_xlock(&sc->sc_disks_lock);
 	gp = sc->sc_geom;
@@ -1252,6 +1635,12 @@ g_concat_dumpconf(struct sbuf *sb, const char *indent, struct g_geom *gp,
 			break;
 		}
 		sbuf_cat(sb, "</Type>\n");
+		if (sc->sc_zone_mode == DISK_ZONE_MODE_HOST_MANAGED) {
+			sbuf_printf(sb, "%s<Zoned>HOST_MANAGED</Zoned>\n",
+			    indent);
+			sbuf_printf(sb, "%s<ZoneLength>%ju</ZoneLength>\n",
+			    indent, (uintmax_t)sc->sc_zone_length);
+		}
 		sbuf_printf(sb, "%s<Status>Total=%u, Online=%u</Status>\n",
 		    indent, sc->sc_ndisks, g_concat_nvalid(sc));
 		sbuf_printf(sb, "%s<State>", indent);

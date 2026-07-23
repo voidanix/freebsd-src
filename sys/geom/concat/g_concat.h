@@ -44,6 +44,8 @@
 #define	G_CONCAT_VERSION	4
 
 #ifdef _KERNEL
+#include <sys/disk_zone.h>
+
 #define	G_CONCAT_TYPE_MANUAL	0
 #define	G_CONCAT_TYPE_AUTOMATIC	1
 
@@ -71,6 +73,11 @@ struct g_concat_softc {
 
 	uint16_t	 sc_ndisks;
 	TAILQ_HEAD(g_concat_disks, g_concat_disk) sc_disks;
+
+	uint32_t	 sc_zone_mode;	/* zone mode of the components */
+	uint64_t	 sc_zone_length; /* zone length in LBAs */
+	uint8_t		 sc_zone_same;	/* merged report-zones SAME value */
+	struct disk_zone_disk_params sc_zone_params; /* merged parameters */
 
 	struct mtx	 sc_completion_lock; /* synchronizes cross-boundary IOs */
 	struct sx	 sc_disks_lock; /* synchronizes modification of sc_disks */
