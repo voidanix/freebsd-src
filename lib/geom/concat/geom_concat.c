@@ -131,6 +131,17 @@ concat_label(struct gctl_req *req)
 	}
 	hardcode = gctl_get_int(req, "hardcode");
 
+	for (i = 1; i < nargs; i++) {
+		name = gctl_get_ascii(req, "arg%d", i);
+		if (g_provider_is_host_managed(name)) {
+			gctl_error(req, "Cannot write a label to %s: the "
+			    "last sector of a host-managed zoned device "
+			    "cannot hold metadata.  Use 'create' instead.",
+			    name);
+			return;
+		}
+	}
+
 	/*
 	 * Clear last sector first to spoil all components if device exists.
 	 */

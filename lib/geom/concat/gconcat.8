@@ -22,7 +22,7 @@
 .\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
 .\"
-.Dd January 23, 2025
+.Dd July 23, 2026
 .Dt GCONCAT 8
 .Os
 .Sh NAME
@@ -171,6 +171,28 @@ Additional options:
 .It Fl v
 Be more verbose.
 .El
+.Sh ZONED DEVICES
+Host-managed zoned providers can be concatenated with the
+.Dq manual
+method into one larger zoned device that accepts zone commands
+.Po see
+.Xr zonectl 8
+.Pc .
+All components must be host-managed, share the same zone length and
+sector size, and every component except the last must be a whole number
+of equally sized zones, so that the concatenation is indistinguishable
+from a single zoned device.
+.Pp
+The
+.Dq automatic
+method is refused on host-managed providers: their last sector normally
+lies in a sequential-write-required zone and cannot hold metadata.
+For the same reason
+.Cm append
+is not supported on zoned devices, as it would renumber the zones past
+the old end of the device.
+Mixing zoned and conventional components is not supported; host-aware
+and drive-managed providers are treated as conventional disks.
 .Sh SYSCTL VARIABLES
 The following
 .Xr sysctl 8
@@ -219,7 +241,8 @@ growfs /dev/concat/data
 .Xr mount 8 ,
 .Xr newfs 8 ,
 .Xr sysctl 8 ,
-.Xr umount 8
+.Xr umount 8 ,
+.Xr zonectl 8
 .Sh HISTORY
 The
 .Nm
