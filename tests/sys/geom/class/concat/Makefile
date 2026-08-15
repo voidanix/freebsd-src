@@ -7,6 +7,8 @@ TAP_TESTS_SH+=	2_test
 TAP_TESTS_SH+=	append1
 TAP_TESTS_SH+=	append2
 
+ATF_TESTS_SH+=	zoned_test
+
 ${PACKAGE}FILES+=		conf.sh
 
 .for t in ${TAP_TESTS_SH}
