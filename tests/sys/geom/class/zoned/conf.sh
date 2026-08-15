@@ -10,15 +10,13 @@ gzoned_test_setup()
 # Print the write pointer LBA of the zone containing the given LBA.
 zone_wp()
 {
-	zonectl -d /dev/${md}.zoned -c rz -l $1 -P script | \
-	    awk -F',' 'NR == 1 {gsub(/ /, "", $3); print $3}'
+	zoned_zone_wp /dev/${md}.zoned $1
 }
 
 # Print the start LBA of the given zone number.
 zone_start()
 {
-	zonectl -d /dev/${md}.zoned -c rz -P script | \
-	    awk -F',' -v n=$(($1 + 1)) 'NR == n {gsub(/ /, "", $1); print $1}'
+	zoned_zone_start /dev/${md}.zoned $1
 }
 
 # Print the number of zones matching a report option.
