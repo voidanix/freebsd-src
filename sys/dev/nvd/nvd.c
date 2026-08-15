@@ -474,6 +474,17 @@ nvdc_ns_added(device_t dev, struct nvme_namespace *ns)
 	device_t		 pdev = nvd_ctrlr->ctrlr->dev;
 	int			 unit;
 
+	/*
+	 * Zoned namespaces require the host to follow the zone write rules,
+	 * which nvd(4) does not implement; exposing them as regular disks
+	 * would just produce I/O errors.  Use nda(4) for these instead.
+	 */
+	if (nvme_ns_get_flags(ns) & NVME_NS_ZONED) {
+		device_printf(pdev, "zoned namespaces are not supported by "
+		    "nvd(4), use nda(4) instead\n");
+		return (0);
+	}
+
 	ndisk = malloc(sizeof(struct nvd_disk), M_NVD, M_ZERO | M_WAITOK);
 	ndisk->ctrlr = nvd_ctrlr;
 	ndisk->ns = ns;
@@ -571,8 +582,9 @@ nvdc_ns_removed(device_t dev, struct nvme_namespace *ns)
 	struct nvd_controller	*nvd_ctrlr = device_get_softc(dev);
 	struct nvd_disk		*ndisk = nvd_ns_to_disk(nvd_ctrlr, ns);
 
+	/* Nothing to tear down for a namespace that was never attached. */
 	if (ndisk == NULL)
-		panic("nvdc: no namespace found for ns  %p", ns);
+		return (0);
 	nvd_gone(ndisk);
 	/* gonecb removes it from the list -- no need to wait */
 	return (0);
@@ -586,8 +598,13 @@ nvdc_ns_changed(device_t dev, uint32_t nsid)
 	struct disk		*disk;
 	struct nvme_namespace	*ns;
 
+	/*
+	 * Namespaces without a disk, such as the zoned ones declined above
+	 * and the inactive ones the controller skips when it announces
+	 * namespaces, have nothing to resize.
+	 */
 	if (ndisk == NULL)
-		panic("nvdc: no namespace found for %d", nsid);
+		return (0);
 	disk = ndisk->disk;
 	ns = ndisk->ns;
 

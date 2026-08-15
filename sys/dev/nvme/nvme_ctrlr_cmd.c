@@ -30,46 +30,41 @@
 #include "nvme_private.h"
 
 void
-nvme_ctrlr_cmd_identify_controller(struct nvme_controller *ctrlr, void *payload,
-	nvme_cb_fn_t cb_fn, void *cb_arg)
+nvme_ctrlr_cmd_identify(struct nvme_controller *ctrlr, uint8_t cns,
+	uint16_t cntid, uint32_t nsid, uint8_t csi, void *payload,
+	uint32_t payload_size, nvme_cb_fn_t cb_fn, void *cb_arg)
 {
 	struct nvme_request *req;
 	struct nvme_command *cmd;
 
-	req = nvme_allocate_request_vaddr(payload,
-	    sizeof(struct nvme_controller_data), M_WAITOK, cb_fn, cb_arg);
+	req = nvme_allocate_request_vaddr(payload, payload_size, M_WAITOK,
+	    cb_fn, cb_arg);
 
 	cmd = &req->cmd;
 	cmd->opc = NVME_OPC_IDENTIFY;
-
-	/*
-	 * TODO: create an identify command data structure, which
-	 *  includes this CNS bit in cdw10.
-	 */
-	cmd->cdw10 = htole32(1);
+	cmd->nsid = htole32(nsid);
+	cmd->cdw10 = htole32((uint32_t)cntid << 16 | cns);
+	cmd->cdw11 = htole32((uint32_t)csi << 24);
 
 	nvme_ctrlr_submit_admin_request(ctrlr, req);
+}
+
+void
+nvme_ctrlr_cmd_identify_controller(struct nvme_controller *ctrlr, void *payload,
+	nvme_cb_fn_t cb_fn, void *cb_arg)
+{
+
+	nvme_ctrlr_cmd_identify(ctrlr, NVME_CNS_ID_CTRLR, 0, 0, 0, payload,
+	    sizeof(struct nvme_controller_data), cb_fn, cb_arg);
 }
 
 void
 nvme_ctrlr_cmd_identify_namespace(struct nvme_controller *ctrlr, uint32_t nsid,
 	void *payload, nvme_cb_fn_t cb_fn, void *cb_arg)
 {
-	struct nvme_request *req;
-	struct nvme_command *cmd;
 
-	req = nvme_allocate_request_vaddr(payload,
-	    sizeof(struct nvme_namespace_data), M_WAITOK, cb_fn, cb_arg);
-
-	cmd = &req->cmd;
-	cmd->opc = NVME_OPC_IDENTIFY;
-
-	/*
-	 * TODO: create an identify command data structure
-	 */
-	cmd->nsid = htole32(nsid);
-
-	nvme_ctrlr_submit_admin_request(ctrlr, req);
+	nvme_ctrlr_cmd_identify(ctrlr, NVME_CNS_ID_NS, 0, nsid, 0, payload,
+	    sizeof(struct nvme_namespace_data), cb_fn, cb_arg);
 }
 
 void

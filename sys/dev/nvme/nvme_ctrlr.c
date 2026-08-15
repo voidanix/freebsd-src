@@ -393,7 +393,15 @@ nvme_ctrlr_enable(struct nvme_controller *ctrlr)
 	/* Initialization values for CC */
 	cc = 0;
 	cc |= NVMEF(NVME_CC_REG_EN, 1);
-	cc |= NVMEF(NVME_CC_REG_CSS, 0);
+	/*
+	 * Select all supported I/O command sets when the controller
+	 * implements them (CAP.CSS bit 6) so that namespaces using a
+	 * command set other than NVM (e.g. ZNS) are active.
+	 */
+	if (NVME_CAP_HI_CSS_IOCS(ctrlr->cap_hi))
+		cc |= NVMEF(NVME_CC_REG_CSS, NVME_CC_CSS_IOCS);
+	else
+		cc |= NVMEF(NVME_CC_REG_CSS, NVME_CC_CSS_NVM);
 	cc |= NVMEF(NVME_CC_REG_AMS, 0);
 	cc |= NVMEF(NVME_CC_REG_SHN, 0);
 	cc |= NVMEF(NVME_CC_REG_IOSQES, ctrlr->io_sqes);

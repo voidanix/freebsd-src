@@ -99,6 +99,11 @@ typedef enum {
 	NDA_CCB_TYPE_MASK	= 0x0F,
 } nda_ccb_state;
 
+typedef enum {
+	NDA_ZONE_NONE		= 0x00,
+	NDA_ZONE_HOST_MANAGED	= 0x01,
+} nda_zone_mode;
+
 /* Offsets into our private area for storing information */
 #define ccb_state	ccb_h.ppriv_field0
 #define ccb_bp		ccb_h.ppriv_ptr1	/* For NDA_CCB_BUFFER_IO */
@@ -121,6 +126,11 @@ struct nda_softc {
 	uint64_t		trim_count;
 	uint64_t		trim_ranges;
 	uint64_t		trim_lbas;
+	nda_zone_mode		zone_mode;
+	uint64_t		zone_size;		/* Zone size in LBAs */
+	uint64_t		max_open_zones;		/* 0 == no limit */
+	uint64_t		max_active_zones;	/* 0 == no limit */
+	bool			read_across_zones;	/* OZCS.RAZB */
 #ifdef CAM_TEST_FAILURE
 	int			force_read_error;
 	int			force_write_error;
@@ -153,6 +163,7 @@ static	void		ndaasync(void *callback_arg, uint32_t code,
 				struct cam_path *path, void *arg);
 static	void		ndasysctlinit(void *context, int pending);
 static	int		ndaflagssysctl(SYSCTL_HANDLER_ARGS);
+static	int		ndazonemodesysctl(SYSCTL_HANDLER_ARGS);
 static	periph_ctor_t	ndaregister;
 static	periph_dtor_t	ndacleanup;
 static	periph_start_t	ndastart;
@@ -287,17 +298,322 @@ nda_nvme_rw_bio(struct nda_softc *softc, struct ccb_nvmeio *nvmeio,
 	nvme_ns_rw_cmd(&nvmeio->cmd, rwcmd, softc->nsid, lba, count);
 }
 
+static int
+nda_zone_bio_to_nvme(int disk_zone_cmd)
+{
+	switch (disk_zone_cmd) {
+	case DISK_ZONE_OPEN:
+		return (NVME_ZONE_SEND_OPEN);
+	case DISK_ZONE_CLOSE:
+		return (NVME_ZONE_SEND_CLOSE);
+	case DISK_ZONE_FINISH:
+		return (NVME_ZONE_SEND_FINISH);
+	case DISK_ZONE_RWP:
+		return (NVME_ZONE_SEND_RESET);
+	}
+
+	return (-1);
+}
+
+static int
+nda_zone_rep_to_nvme(uint8_t rep_options)
+{
+	switch (rep_options) {
+	case DISK_ZONE_REP_ALL:
+		return (NVME_ZONE_REPORT_ALL);
+	case DISK_ZONE_REP_EMPTY:
+		return (NVME_ZONE_REPORT_EMPTY);
+	case DISK_ZONE_REP_IMP_OPEN:
+		return (NVME_ZONE_REPORT_IMP_OPEN);
+	case DISK_ZONE_REP_EXP_OPEN:
+		return (NVME_ZONE_REPORT_EXP_OPEN);
+	case DISK_ZONE_REP_CLOSED:
+		return (NVME_ZONE_REPORT_CLOSED);
+	case DISK_ZONE_REP_FULL:
+		return (NVME_ZONE_REPORT_FULL);
+	case DISK_ZONE_REP_READONLY:
+		return (NVME_ZONE_REPORT_READONLY);
+	case DISK_ZONE_REP_OFFLINE:
+		return (NVME_ZONE_REPORT_OFFLINE);
+	}
+
+	return (-1);
+}
+
+static int
+nda_zone_cmd(struct cam_periph *periph, union ccb *ccb, struct bio *bp,
+    int *queue_ccb)
+{
+	struct nda_softc *softc;
+	int error;
+
+	error = 0;
+
+	if (bp->bio_cmd != BIO_ZONE) {
+		error = EINVAL;
+		goto bailout;
+	}
+
+	softc = periph->softc;
+
+	switch (bp->bio_zone.zone_cmd) {
+	case DISK_ZONE_OPEN:
+	case DISK_ZONE_CLOSE:
+	case DISK_ZONE_FINISH:
+	case DISK_ZONE_RWP: {
+		int send_action;
+		bool select_all;
+
+		send_action = nda_zone_bio_to_nvme(bp->bio_zone.zone_cmd);
+		if (send_action == -1) {
+			xpt_print(periph->path, "Cannot translate zone "
+			    "cmd %#x to NVMe\n", bp->bio_zone.zone_cmd);
+			error = EINVAL;
+			goto bailout;
+		}
+
+		select_all = (bp->bio_zone.zone_params.rwp.flags &
+		    DISK_ZONE_RWP_FLAG_ALL) != 0;
+
+		cam_fill_nvmeio(&ccb->nvmeio,
+		    0,			/* retries */
+		    ndadone,		/* cbfcnp */
+		    CAM_DIR_NONE,	/* flags */
+		    NULL,		/* data_ptr */
+		    0,			/* dxfer_len */
+		    nda_default_timeout * 1000); /* timeout 30s */
+		nvme_zns_mgmt_send_cmd(&ccb->nvmeio.cmd, softc->nsid,
+		    bp->bio_zone.zone_params.rwp.id, select_all,
+		    send_action);
+		*queue_ccb = 1;
+
+		break;
+	}
+	case DISK_ZONE_REPORT_ZONES: {
+		uint8_t *rz_ptr;
+		uint32_t num_entries, max_entries, alloc_size;
+		struct disk_zone_report *rep;
+		int resp_option;
+
+		rep = &bp->bio_zone.zone_params.report;
+
+		num_entries = rep->entries_allocated;
+		if (num_entries == 0) {
+			xpt_print(periph->path, "No entries allocated for "
+			    "Report Zones request\n");
+			error = EINVAL;
+			goto bailout;
+		}
+		resp_option = nda_zone_rep_to_nvme(rep->rep_options);
+		if (resp_option == -1) {
+			xpt_print(periph->path, "Cannot translate zone "
+			    "reporting option %#x to NVMe\n",
+			    rep->rep_options);
+			error = EINVAL;
+			goto bailout;
+		}
+		/*
+		 * Trim the request to what the controller transfers in a
+		 * single command. This keeps room for the report header and a
+		 * whole number of zone descriptors.
+		 */
+		max_entries = (softc->disk->d_maxsize -
+		    sizeof(struct nvme_zone_report)) /
+		    sizeof(struct nvme_zone_descriptor);
+		num_entries = MIN(num_entries, max_entries);
+		alloc_size = sizeof(struct nvme_zone_report) +
+		    (sizeof(struct nvme_zone_descriptor) * num_entries);
+		rz_ptr = malloc(alloc_size, M_NVMEDA, M_NOWAIT | M_ZERO);
+		if (rz_ptr == NULL) {
+			xpt_print(periph->path, "Unable to allocate memory "
+			   "for Report Zones request\n");
+			error = ENOMEM;
+			goto bailout;
+		}
+
+		cam_fill_nvmeio(&ccb->nvmeio,
+		    0,			/* retries */
+		    ndadone,		/* cbfcnp */
+		    CAM_DIR_IN,		/* flags */
+		    rz_ptr,		/* data_ptr */
+		    alloc_size,		/* dxfer_len */
+		    nda_default_timeout * 1000); /* timeout 30s */
+		/*
+		 * Ask for a *full* report so that the number of zones returned
+		 * in the header is the total number of zones matching the
+		 * reporting options: this is what the entries_available field
+		 * wants.
+		 */
+		nvme_zns_mgmt_recv_cmd(&ccb->nvmeio.cmd, softc->nsid,
+		    rep->starting_id, alloc_size, NVME_ZONE_RECV_REPORT,
+		    resp_option, false);
+
+		/*
+		 * BIO_ZONE would not normally need this.  However, this is used
+		 * by devstat_end_transaction_bio() to determine how much data
+		 * was transferred.  Because the size of the NVMe structs is
+		 * different than the size of the BIO interface structs, the
+		 * amount of data that is actually transferred from the drive
+		 * will be different than the amount of data transferred to the
+		 * user.
+		 */
+		bp->bio_bcount = bp->bio_length;
+
+		*queue_ccb = 1;
+
+		break;
+	}
+	case DISK_ZONE_GET_PARAMS: {
+		struct disk_zone_disk_params *params;
+
+		params = &bp->bio_zone.zone_params.disk_params;
+		bzero(params, sizeof(*params));
+
+		switch (softc->zone_mode) {
+		case NDA_ZONE_HOST_MANAGED:
+			params->zone_mode = DISK_ZONE_MODE_HOST_MANAGED;
+			break;
+		default:
+		case NDA_ZONE_NONE:
+			params->zone_mode = DISK_ZONE_MODE_NONE;
+			break;
+		}
+
+		/*
+		 * Reads are permitted anywhere in a zone that is not in the
+		 * ZSO:Offline state.
+		 */
+		params->flags |= DISK_ZONE_DISK_URSWRZ;
+
+		if (softc->max_open_zones != 0) {
+			params->max_seq_zones = softc->max_open_zones;
+			params->flags |= DISK_ZONE_MAX_SEQ_SET;
+		}
+
+		params->flags |= DISK_ZONE_RZ_SUP | DISK_ZONE_OPEN_SUP |
+		    DISK_ZONE_CLOSE_SUP | DISK_ZONE_FINISH_SUP |
+		    DISK_ZONE_RWP_SUP;
+		break;
+	}
+	default:
+		break;
+	}
+bailout:
+	return (error);
+}
+
+static void
+ndazonedone(struct cam_periph *periph, union ccb *ccb)
+{
+	struct nda_softc *softc;
+	struct bio *bp;
+
+	softc = periph->softc;
+	bp = (struct bio *)ccb->ccb_bp;
+
+	switch (bp->bio_zone.zone_cmd) {
+	case DISK_ZONE_OPEN:
+	case DISK_ZONE_CLOSE:
+	case DISK_ZONE_FINISH:
+	case DISK_ZONE_RWP:
+		break;
+	case DISK_ZONE_REPORT_ZONES: {
+		uint32_t avail_len, max_desc;
+		struct disk_zone_report *rep;
+		struct nvme_zone_report *hdr;
+		struct nvme_zone_descriptor *desc;
+		struct disk_zone_rep_entry *entry;
+		uint64_t num_avail;
+		uint32_t num_to_fill, i;
+
+		rep = &bp->bio_zone.zone_params.report;
+		avail_len = ccb->nvmeio.dxfer_len;
+		hdr = (struct nvme_zone_report *)ccb->nvmeio.data_ptr;
+
+		/*
+		 * The transfer is dxfer_len bytes and the buffer was
+		 * zeroed before the command, so every descriptor slot in
+		 * it is safe to byte swap, whether or not the device
+		 * filled it in.
+		 */
+		max_desc = (avail_len - sizeof(*hdr)) / sizeof(*desc);
+		nvme_zone_report_swapbytes(hdr, max_desc);
+
+		/*
+		 * Every zone has the same length (ZSZE) and the same type,
+		 * which is all the SAME field describes.  Zone capacity may
+		 * vary per zone, but does not affect it.
+		 */
+		rep->header.same = DISK_ZONE_SAME_ALL_SAME;
+		rep->header.maximum_lba = softc->disk->d_mediasize /
+		    softc->disk->d_sectorsize - 1;
+		rep->entries_available = MIN(hdr->nr_zones, UINT32_MAX);
+
+		num_avail = MIN(hdr->nr_zones, max_desc);
+		num_to_fill = MIN(num_avail, rep->entries_allocated);
+		if (num_to_fill == 0) {
+			rep->entries_filled = 0;
+			bp->bio_resid = bp->bio_bcount;
+			break;
+		}
+
+		for (i = 0, desc = &hdr->zone_desc[0], entry = &rep->entries[0];
+		     i < num_to_fill; i++, desc++, entry++) {
+			if (NVMEV(NVME_ZONE_DESC_ZT, desc->zt) ==
+			    NVME_ZONE_TYPE_SEQUENTIAL)
+				entry->zone_type = DISK_ZONE_TYPE_SEQ_REQUIRED;
+			else
+				entry->zone_type =
+				    NVMEV(NVME_ZONE_DESC_ZT, desc->zt);
+			entry->zone_condition =
+			    NVMEV(NVME_ZONE_DESC_ZS, desc->zs);
+			entry->zone_flags = 0;
+			if (NVMEV(NVME_ZONE_DESC_ZA_RZR, desc->za))
+				entry->zone_flags |= DISK_ZONE_FLAG_RESET;
+			entry->zone_length = softc->zone_size;
+			entry->zone_capacity = desc->zcap;
+			entry->zone_start_lba = desc->zslba;
+			entry->write_pointer_lba = desc->wp;
+		}
+		rep->entries_filled = num_to_fill;
+		/*
+		 * Note that this residual is accurate from the user's
+		 * standpoint, but the amount transferred isn't accurate
+		 * from the standpoint of what actually came back from the
+		 * drive.
+		 */
+		bp->bio_resid = bp->bio_bcount - (num_to_fill * sizeof(*entry));
+		break;
+	}
+	case DISK_ZONE_GET_PARAMS:
+	default:
+		/*
+		 * In theory we should not get a GET_PARAMS bio, since it
+		 * should be handled without queueing the command to the
+		 * drive.
+		 */
+		panic("%s: Invalid zone command %d", __func__,
+		    bp->bio_zone.zone_cmd);
+		break;
+	}
+
+	if (bp->bio_zone.zone_cmd == DISK_ZONE_REPORT_ZONES)
+		free(ccb->nvmeio.data_ptr, M_NVMEDA);
+}
+
 static void
 ndasetgeom(struct nda_softc *softc, struct cam_periph *periph)
 {
 	struct disk *disk = softc->disk;
 	const struct nvme_namespace_data *nsd;
 	const struct nvme_controller_data *cd;
+	const struct nvme_zns_namespace_data *znsd;
 	uint8_t flbas_fmt, lbads, vwc_present;
 	u_int flags;
 
 	nsd = nvme_get_identify_ns(periph);
         cd = nvme_get_identify_cntrl(periph);
+	znsd = nvme_get_identify_ns_zns(periph);
 
 	/*
 	 * Preserve flags we can't infer that were set before. UNMAPPED comes
@@ -318,6 +634,26 @@ ndasetgeom(struct nda_softc *softc, struct cam_periph *periph)
 	if (vwc_present)
 		disk->d_flags |= DISKFLAG_CANFLUSHCACHE;
 	disk->d_flags |= flags;
+
+	if (znsd != NULL) {
+		/*
+		 * Zoned namespaces are always host managed.
+		 */
+		softc->zone_mode = NDA_ZONE_HOST_MANAGED;
+		softc->zone_size = znsd->lbafe[flbas_fmt].zsze;
+		/* MAR and MOR are 0's based. */
+		softc->max_active_zones =
+		    znsd->mar == NVME_ZNS_NS_DATA_RESOURCES_UNLIMITED ? 0 :
+		    (uint64_t)znsd->mar + 1;
+		softc->max_open_zones =
+		    znsd->mor == NVME_ZNS_NS_DATA_RESOURCES_UNLIMITED ? 0 :
+		    (uint64_t)znsd->mor + 1;
+		softc->read_across_zones =
+		    NVMEV(NVME_ZNS_NS_DATA_OZCS_RAZB, znsd->ozcs) != 0;
+		disk->d_flags |= DISKFLAG_CANZONE;
+	} else {
+		softc->zone_mode = NDA_ZONE_NONE;
+	}
 }
 
 static void
@@ -560,6 +896,13 @@ ndastrategy(struct bio *bp)
 
 	if (bp->bio_cmd == BIO_DELETE)
 		softc->deletes++;
+
+	/*
+	 * Zone cmds must be ordered, as they can depend on the effects of
+	 * previously issued commands, which may affect commands after them.
+	 */
+	if (bp->bio_cmd == BIO_ZONE)
+		bp->bio_flags |= BIO_ORDERED;
 
 	/*
 	 * Place it in the queue of disk activities for this disk
@@ -865,6 +1208,27 @@ ndasysctlinit(void *context, int pending)
 	    softc, 0, ndaflagssysctl, "A",
 	    "Flags for drive");
 
+	SYSCTL_ADD_PROC(&softc->sysctl_ctx, SYSCTL_CHILDREN(softc->sysctl_tree),
+	    OID_AUTO, "zone_mode", CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
+	    softc, 0, ndazonemodesysctl, "A",
+	    "Zone Mode");
+	SYSCTL_ADD_UQUAD(&softc->sysctl_ctx,
+	    SYSCTL_CHILDREN(softc->sysctl_tree), OID_AUTO,
+	    "zone_size", CTLFLAG_RD, &softc->zone_size,
+	    "Zone size in LBAs");
+	SYSCTL_ADD_UQUAD(&softc->sysctl_ctx,
+	    SYSCTL_CHILDREN(softc->sysctl_tree), OID_AUTO,
+	    "max_open_zones", CTLFLAG_RD, &softc->max_open_zones,
+	    "Maximum number of open zones (0 = no limit)");
+	SYSCTL_ADD_UQUAD(&softc->sysctl_ctx,
+	    SYSCTL_CHILDREN(softc->sysctl_tree), OID_AUTO,
+	    "max_active_zones", CTLFLAG_RD, &softc->max_active_zones,
+	    "Maximum number of active zones (0 = no limit)");
+	SYSCTL_ADD_BOOL(&softc->sysctl_ctx,
+	    SYSCTL_CHILDREN(softc->sysctl_tree), OID_AUTO,
+	    "read_across_zones", CTLFLAG_RD, &softc->read_across_zones, 0,
+	    "Reads may span more than one zone");
+
 #ifdef CAM_IO_STATS
 	softc->sysctl_stats_tree = SYSCTL_ADD_NODE(&softc->sysctl_stats_ctx,
 		SYSCTL_CHILDREN(softc->sysctl_tree), OID_AUTO, "stats",
@@ -902,6 +1266,30 @@ ndasysctlinit(void *context, int pending)
 	    softc->sysctl_tree);
 
 	cam_periph_release(periph);
+}
+
+static int
+ndazonemodesysctl(SYSCTL_HANDLER_ARGS)
+{
+	char tmpbuf[24];
+	struct nda_softc *softc;
+	int error;
+
+	softc = (struct nda_softc *)arg1;
+
+	switch (softc->zone_mode) {
+	case NDA_ZONE_HOST_MANAGED:
+		snprintf(tmpbuf, sizeof(tmpbuf), "Host Managed");
+		break;
+	case NDA_ZONE_NONE:
+	default:
+		snprintf(tmpbuf, sizeof(tmpbuf), "Not Zoned");
+		break;
+	}
+
+	error = sysctl_handle_string(oidp, tmpbuf, sizeof(tmpbuf), req);
+
+	return (error);
 }
 
 static int
@@ -1227,6 +1615,30 @@ ndastart(struct cam_periph *periph, union ccb *start_ccb)
 		case BIO_FLUSH:
 			nda_nvme_flush(softc, nvmeio);
 			break;
+		case BIO_ZONE: {
+			int error, queue_ccb;
+
+			queue_ccb = 0;
+
+			error = nda_zone_cmd(periph, start_ccb, bp, &queue_ccb);
+			if ((error != 0)
+			 || (queue_ccb == 0)) {
+				/*
+				 * g_io_deliver will recursively call start
+				 * routine for ENOMEM... drop the periph lock
+				 * to allow that recursion.
+				 */
+				if (error == ENOMEM)
+					cam_periph_unlock(periph);
+				biofinish(bp, NULL, error);
+				if (error == ENOMEM)
+					cam_periph_lock(periph);
+				xpt_release_ccb(start_ccb);
+				ndaschedule(periph);
+				return;
+			}
+			break;
+		}
 		default:
 			biofinish(bp, NULL, EOPNOTSUPP);
 			xpt_release_ccb(start_ccb);
@@ -1298,8 +1710,14 @@ ndadone(struct cam_periph *periph, union ccb *done_ccb)
 			if (error != 0) {
 				bp->bio_resid = bp->bio_bcount;
 				bp->bio_flags |= BIO_ERROR;
+				if (bp->bio_cmd == BIO_ZONE &&
+				    bp->bio_zone.zone_cmd ==
+				    DISK_ZONE_REPORT_ZONES)
+					free(nvmeio->data_ptr, M_NVMEDA);
 			} else {
 				bp->bio_resid = 0;
+				if (bp->bio_cmd == BIO_ZONE)
+					ndazonedone(periph, done_ccb);
 			}
 			softc->outstanding_cmds--;
 

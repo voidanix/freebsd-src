@@ -151,6 +151,7 @@ struct cam_ed {
 	struct task	 device_destroy_task;
 	struct nvme_controller_data *nvme_cdata;
 	struct nvme_namespace_data *nvme_data;
+	struct nvme_zns_namespace_data *nvme_zns_data;
 };
 
 /*

@@ -209,6 +209,7 @@ struct nvme_namespace {
 	uint32_t			flags;
 	struct cdev			*cdev;
 	uint32_t			boundary;
+	uint8_t				csi;
 	struct mtx			lock;
 };
 
@@ -391,6 +392,10 @@ void	nvme_ctrlr_cmd_identify_controller(struct nvme_controller *ctrlr,
 void	nvme_ctrlr_cmd_identify_namespace(struct nvme_controller *ctrlr,
 					  uint32_t nsid, void *payload,
 					  nvme_cb_fn_t cb_fn, void *cb_arg);
+void	nvme_ctrlr_cmd_identify(struct nvme_controller *ctrlr, uint8_t cns,
+				uint16_t cntid, uint32_t nsid, uint8_t csi,
+				void *payload, uint32_t payload_size,
+				nvme_cb_fn_t cb_fn, void *cb_arg);
 void	nvme_ctrlr_cmd_set_interrupt_coalescing(struct nvme_controller *ctrlr,
 						uint32_t microseconds,
 						uint32_t threshold,

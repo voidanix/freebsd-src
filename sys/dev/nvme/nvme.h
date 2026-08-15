@@ -103,6 +103,10 @@ struct sbuf;
 #define NVME_CAP_HI_REG_CSS_MASK			(0xff)
 #define NVME_CAP_HI_REG_CSS_NVM_SHIFT			(5)
 #define NVME_CAP_HI_REG_CSS_NVM_MASK			(0x1)
+#define NVME_CAP_HI_REG_CSS_IOCS_SHIFT			(11)
+#define NVME_CAP_HI_REG_CSS_IOCS_MASK			(0x1)
+#define NVME_CAP_HI_REG_CSS_NOIO_SHIFT			(12)
+#define NVME_CAP_HI_REG_CSS_NOIO_MASK			(0x1)
 #define NVME_CAP_HI_REG_BPS_SHIFT			(13)
 #define NVME_CAP_HI_REG_BPS_MASK			(0x1)
 #define NVME_CAP_HI_REG_CPS_SHIFT			(14)
@@ -129,6 +133,10 @@ struct sbuf;
 	NVMEV(NVME_CAP_HI_REG_CSS, x)
 #define NVME_CAP_HI_CSS_NVM(x) \
 	NVMEV(NVME_CAP_HI_REG_CSS_NVM, x)
+#define NVME_CAP_HI_CSS_IOCS(x) \
+	NVMEV(NVME_CAP_HI_REG_CSS_IOCS, x)
+#define NVME_CAP_HI_CSS_NOIO(x) \
+	NVMEV(NVME_CAP_HI_REG_CSS_NOIO, x)
 #define NVME_CAP_HI_BPS(x) \
 	NVMEV(NVME_CAP_HI_REG_BPS, x)
 #define NVME_CAP_HI_CPS(x) \
@@ -164,6 +172,10 @@ struct sbuf;
 #define NVME_CC_REG_IOCQES_MASK				(0xF)
 #define NVME_CC_REG_CRIME_SHIFT				(24)
 #define NVME_CC_REG_CRIME_MASK				(0x1)
+
+#define NVME_CC_CSS_NVM					(0x0)
+#define NVME_CC_CSS_IOCS				(0x6)
+#define NVME_CC_CSS_NOIO				(0x7)
 
 #define NVME_CSTS_REG_RDY_SHIFT				(0)
 #define NVME_CSTS_REG_RDY_MASK				(0x1)
@@ -977,6 +989,16 @@ enum nvme_command_specific_status_code {
 	NVME_SC_CONFLICTING_ATTRIBUTES		= 0x80,
 	NVME_SC_INVALID_PROTECTION_INFO		= 0x81,
 	NVME_SC_ATTEMPTED_WRITE_TO_RO_PAGE	= 0x82,
+
+	/* Zoned Namespace Command Set */
+	NVME_SC_ZONE_BOUNDARY_ERROR		= 0xb8,
+	NVME_SC_ZONE_IS_FULL			= 0xb9,
+	NVME_SC_ZONE_IS_READONLY		= 0xba,
+	NVME_SC_ZONE_IS_OFFLINE			= 0xbb,
+	NVME_SC_ZONE_INVALID_WRITE		= 0xbc,
+	NVME_SC_TOO_MANY_ACTIVE_ZONES		= 0xbd,
+	NVME_SC_TOO_MANY_OPEN_ZONES		= 0xbe,
+	NVME_SC_INVALID_ZONE_STATE_TRANSITION	= 0xbf,
 };
 
 /* media error status codes */
@@ -1050,6 +1072,25 @@ enum nvme_admin_opcode {
 	NVME_OPC_GET_LBA_STATUS			= 0x86,
 };
 
+/* command set identifiers */
+enum nvme_csi {
+	NVME_CSI_NVM				= 0x00,
+	NVME_CSI_KV				= 0x01,
+	NVME_CSI_ZNS				= 0x02,
+};
+
+/* identify controller or namespace structure (CNS) values */
+enum nvme_cns {
+	NVME_CNS_ID_NS				= 0x00,
+	NVME_CNS_ID_CTRLR			= 0x01,
+	NVME_CNS_ACTIVE_NS_LIST			= 0x02,
+	NVME_CNS_ID_NS_DESC_LIST		= 0x03,
+	/* 0x04 - NVM set list */
+	NVME_CNS_ID_NS_IOCS			= 0x05,
+	NVME_CNS_ID_CTRLR_IOCS			= 0x06,
+	NVME_CNS_ACTIVE_NS_LIST_IOCS		= 0x07,
+};
+
 /* nvme nvm opcodes */
 enum nvme_nvm_opcode {
 	NVME_OPC_FLUSH				= 0x00,
@@ -1071,6 +1112,11 @@ enum nvme_nvm_opcode {
 	NVME_OPC_RESERVATION_RELEASE		= 0x15,
 	/* 0x16-0x18 - reserved */
 	NVME_OPC_COPY				= 0x19,
+
+	/* Zoned Namespace Command Set */
+	NVME_OPC_ZONE_MGMT_SEND			= 0x79,
+	NVME_OPC_ZONE_MGMT_RECV			= 0x7a,
+	NVME_OPC_ZONE_APPEND			= 0x7d,
 };
 
 enum nvme_feature {
@@ -1631,6 +1677,254 @@ struct nvme_ns_list {
 
 _Static_assert(sizeof(struct nvme_ns_list) == 4096, "bad size for nvme_ns_list");
 
+/* Namespace Identification Descriptor (CNS 03h) */
+struct nvme_ns_id_descriptor {
+	/** namespace identifier type */
+	uint8_t			nidt;
+
+	/** namespace identifier length */
+	uint8_t			nidl;
+
+	uint8_t			reserved2[2];
+
+	/** namespace identifier */
+	uint8_t			nid[];
+} __packed;
+
+enum nvme_nidt {
+	NVME_NIDT_EUI64			= 0x01,
+	NVME_NIDT_NGUID			= 0x02,
+	NVME_NIDT_UUID			= 0x03,
+	NVME_NIDT_CSI			= 0x04,
+};
+
+/* Size of the Namespace Identification Descriptor list. */
+#define	NVME_NS_ID_DESC_LIST_SIZE	4096
+
+/*
+ * Return the I/O command set a namespace is associated with, given its
+ * Namespace Identification Descriptor list.  A list with no Command Set
+ * Identifier descriptor describes an NVM Command Set namespace.
+ */
+static inline uint8_t
+nvme_ns_id_desc_list_csi(const void *list, size_t len)
+{
+	const struct nvme_ns_id_descriptor *desc;
+	size_t off;
+
+	off = 0;
+	while (len - off >= sizeof(*desc)) {
+		desc = (const struct nvme_ns_id_descriptor *)
+		    ((const uint8_t *)list + off);
+		off += sizeof(*desc);
+		/* A zeroed or overlong descriptor ends the list. */
+		if (desc->nidt == 0 || desc->nidl == 0 ||
+		    desc->nidl > len - off)
+			break;
+		if (desc->nidt == NVME_NIDT_CSI)
+			return (desc->nid[0]);
+		off += desc->nidl;
+	}
+
+	return (NVME_CSI_NVM);
+}
+
+/*
+ * Zoned Namespace Command Set (CSI 02h) definitions.
+ */
+
+/* Zone Management Send action (cdw13 bits 7:0) */
+enum nvme_zone_send_action {
+	NVME_ZONE_SEND_CLOSE		= 0x01,
+	NVME_ZONE_SEND_FINISH		= 0x02,
+	NVME_ZONE_SEND_OPEN		= 0x03,
+	NVME_ZONE_SEND_RESET		= 0x04,
+	NVME_ZONE_SEND_OFFLINE		= 0x05,
+	NVME_ZONE_SEND_SET_ZDE		= 0x10,
+};
+
+/* Zone Management Send: select all zones (cdw13 bit 8) */
+#define	NVME_ZONE_SEND_SELECT_ALL	(1 << 8)
+
+/* Zone Management Receive action (cdw13 bits 7:0) */
+enum nvme_zone_recv_action {
+	NVME_ZONE_RECV_REPORT		= 0x00,
+	NVME_ZONE_RECV_EXT_REPORT	= 0x01,
+};
+
+/* Zone Management Receive: reporting options (cdw13 bits 15:8) */
+enum nvme_zone_report_option {
+	NVME_ZONE_REPORT_ALL		= 0x00,
+	NVME_ZONE_REPORT_EMPTY		= 0x01,
+	NVME_ZONE_REPORT_IMP_OPEN	= 0x02,
+	NVME_ZONE_REPORT_EXP_OPEN	= 0x03,
+	NVME_ZONE_REPORT_CLOSED		= 0x04,
+	NVME_ZONE_REPORT_FULL		= 0x05,
+	NVME_ZONE_REPORT_READONLY	= 0x06,
+	NVME_ZONE_REPORT_OFFLINE	= 0x07,
+};
+
+/* Zone Management Receive: return partial report (cdw13 bit 16) */
+#define	NVME_ZONE_RECV_PARTIAL		(1 << 16)
+
+enum nvme_zone_type {
+	NVME_ZONE_TYPE_SEQUENTIAL	= 0x02,
+};
+
+enum nvme_zone_state {
+	NVME_ZONE_STATE_EMPTY		= 0x01,
+	NVME_ZONE_STATE_IMP_OPEN	= 0x02,
+	NVME_ZONE_STATE_EXP_OPEN	= 0x03,
+	NVME_ZONE_STATE_CLOSED		= 0x04,
+	NVME_ZONE_STATE_READONLY	= 0x0d,
+	NVME_ZONE_STATE_FULL		= 0x0e,
+	NVME_ZONE_STATE_OFFLINE		= 0x0f,
+};
+
+struct nvme_zone_descriptor {
+	/** zone type */
+	uint8_t			zt;
+#define NVME_ZONE_DESC_ZT_SHIFT			(0)
+#define NVME_ZONE_DESC_ZT_MASK			(0xF)
+
+	/** zone state */
+	uint8_t			zs;
+#define NVME_ZONE_DESC_ZS_SHIFT			(4)
+#define NVME_ZONE_DESC_ZS_MASK			(0xF)
+
+	/** zone attributes */
+	uint8_t			za;
+/* Zone Finished by Controller */
+#define NVME_ZONE_DESC_ZA_ZFC_SHIFT		(0)
+#define NVME_ZONE_DESC_ZA_ZFC_MASK		(0x1)
+/* Finish Zone Recommended */
+#define NVME_ZONE_DESC_ZA_FZR_SHIFT		(1)
+#define NVME_ZONE_DESC_ZA_FZR_MASK		(0x1)
+/* Reset Zone Recommended */
+#define NVME_ZONE_DESC_ZA_RZR_SHIFT		(2)
+#define NVME_ZONE_DESC_ZA_RZR_MASK		(0x1)
+/* ZRWA Valid */
+#define NVME_ZONE_DESC_ZA_ZRWAV_SHIFT		(3)
+#define NVME_ZONE_DESC_ZA_ZRWAV_MASK		(0x1)
+/* Zone Descriptor Extension Valid */
+#define NVME_ZONE_DESC_ZA_ZDEV_SHIFT		(7)
+#define NVME_ZONE_DESC_ZA_ZDEV_MASK		(0x1)
+
+	/** zone attributes information */
+	uint8_t			zai;
+
+	/* bytes 4-7: Reserved */
+	uint8_t			reserved1[4];
+
+	/** zone capacity */
+	uint64_t		zcap;
+
+	/** zone start logical block address */
+	uint64_t		zslba;
+
+	/** write pointer */
+	uint64_t		wp;
+
+	/* bytes 32-63: Reserved */
+	uint8_t			reserved2[32];
+} __packed __aligned(4);
+
+_Static_assert(sizeof(struct nvme_zone_descriptor) == 64,
+    "bad size for nvme_zone_descriptor");
+
+/* Report Zones data structure (Zone Management Receive) */
+struct nvme_zone_report {
+	/** number of zones matching the reporting options */
+	uint64_t		nr_zones;
+
+	/* bytes 8-63: Reserved */
+	uint8_t			reserved1[56];
+
+	struct nvme_zone_descriptor	zone_desc[];
+} __packed __aligned(4);
+
+_Static_assert(sizeof(struct nvme_zone_report) == 64,
+    "bad size for nvme_zone_report");
+
+/* ZNS LBA Format Extension */
+struct nvme_zns_lbafe {
+	/** zone size (in logical blocks) */
+	uint64_t		zsze;
+
+	/** zone descriptor extension size (in units of 64 bytes) */
+	uint8_t			zdes;
+
+	/* bytes 9-15: Reserved */
+	uint8_t			reserved1[7];
+} __packed;
+
+_Static_assert(sizeof(struct nvme_zns_lbafe) == 16,
+    "bad size for nvme_zns_lbafe");
+
+/* I/O Command Set specific Identify Namespace for ZNS (CNS 05h, CSI 02h) */
+struct nvme_zns_namespace_data {
+	/** zone operation characteristics */
+	uint16_t		zoc;
+#define NVME_ZNS_NS_DATA_ZOC_VZC_SHIFT		(0)
+#define NVME_ZNS_NS_DATA_ZOC_VZC_MASK		(0x1)
+#define NVME_ZNS_NS_DATA_ZOC_ZAE_SHIFT		(1)
+#define NVME_ZNS_NS_DATA_ZOC_ZAE_MASK		(0x1)
+
+	/** optional zoned command support */
+	uint16_t		ozcs;
+#define NVME_ZNS_NS_DATA_OZCS_RAZB_SHIFT	(0)
+#define NVME_ZNS_NS_DATA_OZCS_RAZB_MASK		(0x1)
+#define NVME_ZNS_NS_DATA_OZCS_ZRWASUP_SHIFT	(1)
+#define NVME_ZNS_NS_DATA_OZCS_ZRWASUP_MASK	(0x1)
+
+	/** maximum active resources (0's based) */
+	uint32_t		mar;
+
+	/** maximum open resources (0's based) */
+	uint32_t		mor;
+/* Value of mar and mor for a namespace that imposes no limit. */
+#define NVME_ZNS_NS_DATA_RESOURCES_UNLIMITED	(0xffffffff)
+
+	/** reset recommended limit */
+	uint32_t		rrl;
+
+	/** finish recommended limit */
+	uint32_t		frl;
+
+	/** reset recommended limit 1-3 */
+	uint32_t		rrl1;
+	uint32_t		rrl2;
+	uint32_t		rrl3;
+
+	/** finish recommended limit 1-3 */
+	uint32_t		frl1;
+	uint32_t		frl2;
+	uint32_t		frl3;
+
+	/** number of ZRWA resources */
+	uint32_t		numzrwa;
+
+	/** ZRWA flush granularity */
+	uint16_t		zrwafg;
+
+	/** ZRWA size */
+	uint16_t		zrwasz;
+
+	/** ZRWA capability */
+	uint8_t			zrwacap;
+
+	/* bytes 53-2815: Reserved */
+	uint8_t			reserved1[2763];
+
+	/** zns lba format extension support */
+	struct nvme_zns_lbafe	lbafe[64];
+
+	uint8_t			vendor_specific[256];
+} __packed __aligned(4);
+
+_Static_assert(sizeof(struct nvme_zns_namespace_data) == 4096,
+    "bad size for nvme_zns_namespace_data");
+
 struct nvme_command_effects_page {
 	uint32_t		acs[256];
 	uint32_t		iocs[256];
@@ -1923,6 +2217,7 @@ enum nvme_namespace_flags {
 	NVME_NS_ALIVE			= 0x04,
 	NVME_NS_DELTA			= 0x08,
 	NVME_NS_GONE			= 0x10,
+	NVME_NS_ZONED			= 0x20,
 };
 
 int	nvme_ctrlr_passthrough_cmd(struct nvme_controller *ctrlr,
@@ -2063,6 +2358,34 @@ void	nvme_ns_trim_cmd(struct nvme_command *cmd, uint32_t nsid,
 	cmd->nsid = htole32(nsid);
 	cmd->cdw10 = htole32(num_ranges - 1);
 	cmd->cdw11 = htole32(NVME_DSM_ATTR_DEALLOCATE);
+}
+
+static inline
+void	nvme_zns_mgmt_send_cmd(struct nvme_command *cmd, uint32_t nsid,
+    uint64_t slba, bool select_all, uint8_t zsa)
+{
+	cmd->opc = NVME_OPC_ZONE_MGMT_SEND;
+	cmd->nsid = htole32(nsid);
+	cmd->cdw10 = htole32(slba & 0xffffffffu);
+	cmd->cdw11 = htole32(slba >> 32);
+	cmd->cdw13 = htole32(zsa |
+	    (select_all ? NVME_ZONE_SEND_SELECT_ALL : 0));
+}
+
+/* dxfer_len must be a non-zero multiple of four. */
+static inline
+void	nvme_zns_mgmt_recv_cmd(struct nvme_command *cmd, uint32_t nsid,
+    uint64_t slba, uint32_t dxfer_len, uint8_t zra, uint8_t zrasf,
+    bool partial)
+{
+	cmd->opc = NVME_OPC_ZONE_MGMT_RECV;
+	cmd->nsid = htole32(nsid);
+	cmd->cdw10 = htole32(slba & 0xffffffffu);
+	cmd->cdw11 = htole32(slba >> 32);
+	/* Number of dwords to transfer, 0's based */
+	cmd->cdw12 = htole32(dxfer_len / 4 - 1);
+	cmd->cdw13 = htole32(zra | (zrasf << 8) |
+	    (partial ? NVME_ZONE_RECV_PARTIAL : 0));
 }
 
 extern int nvme_use_nvd;
@@ -2251,6 +2574,59 @@ void	nvme_ns_list_swapbytes(struct nvme_ns_list *s __unused)
 
 	for (i = 0; i < 1024; i++)
 		s->ns[i] = le32toh(s->ns[i]);
+#endif
+}
+
+static inline
+void	nvme_zns_namespace_data_swapbytes(
+    struct nvme_zns_namespace_data *s __unused)
+{
+#if _BYTE_ORDER != _LITTLE_ENDIAN
+	s->zoc = le16toh(s->zoc);
+	s->ozcs = le16toh(s->ozcs);
+	s->mar = le32toh(s->mar);
+	s->mor = le32toh(s->mor);
+	s->rrl = le32toh(s->rrl);
+	s->frl = le32toh(s->frl);
+	s->rrl1 = le32toh(s->rrl1);
+	s->rrl2 = le32toh(s->rrl2);
+	s->rrl3 = le32toh(s->rrl3);
+	s->frl1 = le32toh(s->frl1);
+	s->frl2 = le32toh(s->frl2);
+	s->frl3 = le32toh(s->frl3);
+	s->numzrwa = le32toh(s->numzrwa);
+	s->zrwafg = le16toh(s->zrwafg);
+	s->zrwasz = le16toh(s->zrwasz);
+	for (unsigned int i = 0; i < nitems(s->lbafe); i++)
+		s->lbafe[i].zsze = le64toh(s->lbafe[i].zsze);
+#endif
+}
+
+
+static inline
+void	nvme_zone_descriptor_swapbytes(struct nvme_zone_descriptor *s __unused)
+{
+#if _BYTE_ORDER != _LITTLE_ENDIAN
+	s->zcap = le64toh(s->zcap);
+	s->zslba = le64toh(s->zslba);
+	s->wp = le64toh(s->wp);
+#endif
+}
+
+/*
+ * Swap the report header and the first num_zones zone descriptors, which
+ * must all be within the buffer the report was read into.
+ */
+static inline
+void	nvme_zone_report_swapbytes(struct nvme_zone_report *s __unused,
+    uint64_t num_zones __unused)
+{
+#if _BYTE_ORDER != _LITTLE_ENDIAN
+	uint64_t i;
+
+	s->nr_zones = le64toh(s->nr_zones);
+	for (i = 0; i < num_zones; i++)
+		nvme_zone_descriptor_swapbytes(&s->zone_desc[i]);
 #endif
 }
 

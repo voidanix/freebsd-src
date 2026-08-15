@@ -564,6 +564,36 @@ nvme_ns_construct(struct nvme_namespace *ns, uint32_t id,
 	}
 
 	/*
+	 * Determine which I/O command set the namespace is associated with.
+	 * Namespaces using a command set other than NVM (e.g. ZNS)
+	 * can only be active when the controller supports multiple command sets
+	 * (CAP.CSS bit 6) and CC.CSS selected them.  The CSI is reported in the
+	 * Namespace Identification Descriptor list (CNS 03h); any failure to
+	 * retrieve it is treated as the NVM command set.
+	 */
+	ns->csi = NVME_CSI_NVM;
+	if (NVME_CAP_HI_CSS_IOCS(ctrlr->cap_hi) &&
+	    (ctrlr->max_identify_cns == 0 ||
+	     ctrlr->max_identify_cns >= NVME_CNS_ID_NS_DESC_LIST)) {
+		uint8_t *desclist;
+
+		desclist = malloc(NVME_NS_ID_DESC_LIST_SIZE, M_NVME,
+		    M_WAITOK | M_ZERO);
+		status.done = 0;
+		nvme_ctrlr_cmd_identify(ctrlr, NVME_CNS_ID_NS_DESC_LIST, 0, id,
+		    0, desclist, NVME_NS_ID_DESC_LIST_SIZE,
+		    nvme_completion_poll_cb, &status);
+		nvme_completion_poll(&status);
+		if (!nvme_completion_is_error(&status.cpl))
+			ns->csi = nvme_ns_id_desc_list_csi(desclist,
+			    NVME_NS_ID_DESC_LIST_SIZE);
+		free(desclist, M_NVME);
+	}
+	ns->flags &= ~NVME_NS_ZONED;
+	if (ns->csi == NVME_CSI_ZNS)
+		ns->flags |= NVME_NS_ZONED;
+
+	/*
 	 * Check the validity of the format specified. Note: format is a 0-based
 	 * value, so > is appropriate here, not >=.
 	 */

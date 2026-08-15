@@ -25,7 +25,7 @@
 .\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
 .\"
-.Dd October 2, 2025
+.Dd August 9, 2026
 .Dt NDA 4
 .Os
 .Sh NAME
@@ -37,8 +37,7 @@
 .Sh DESCRIPTION
 The
 .Nm
-driver provides support for direct access devices, implementing the
-.Tn NVMe
+driver provides support for direct access devices, implementing the NVMe
 command protocol, that are attached to the system through a host adapter
 supported by the CAM subsystem.
 .Sh HARDWARE
@@ -165,7 +164,36 @@ Total number of trims sent to the hardware.
 Total number of
 .Va BIO_DELETE
 requests queued to the device.
+.It Va kern.cam.nda.N.zone_mode
+The zone mode of the namespace, either
+.Dq Host Managed
+for Zoned Namespaces or
+.Dq Not Zoned .
+.It Va kern.cam.nda.N.zone_size
+The size of each zone in logical blocks, for zoned namespaces.
+.It Va kern.cam.nda.N.max_open_zones
+The maximum number of zones that may be open at once, for zoned
+namespaces.
+Zero means the device reports no limit.
+.It Va kern.cam.nda.N.max_active_zones
+The maximum number of zones that may be active
+.Pq open or closed
+at once, for zoned namespaces.
+Zero means the device reports no limit.
+.It Va kern.cam.nda.N.read_across_zones
+Whether a single read may span more than one zone, for zoned namespaces.
 .El
+.Sh ZONED NAMESPACES
+Namespaces implementing the NVMe Zoned Namespace
+.Pq ZNS
+command set are exposed as host managed zoned block devices.
+Zones can be analyzed and managed through
+.Xr zonectl 8 ,
+or programmatically via the
+.Va DIOCZONECMD
+.Xr ioctl 2 .
+Writes within a zone must be sequential, starting at the zone's write
+pointer.
 .Sh NAMESPACE MAPPING
 Each
 .Xr nvme 4
@@ -205,7 +233,8 @@ NVMe storage device nodes
 .Xr geom 4 ,
 .Xr nvd 4 ,
 .Xr nvme 4 ,
-.Xr gpart 8
+.Xr gpart 8 ,
+.Xr zonectl 8
 .Sh HISTORY
 The
 .Nm

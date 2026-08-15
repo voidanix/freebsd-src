@@ -190,4 +190,14 @@ nvme_get_identify_ns(struct cam_periph *periph)
 
 	return device->nvme_data;
 }
+
+const void *
+nvme_get_identify_ns_zns(struct cam_periph *periph)
+{
+	struct cam_ed *device;
+
+	device = periph->path->device;
+
+	return device->nvme_zns_data;
+}
 #endif

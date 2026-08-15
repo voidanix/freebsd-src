@@ -48,5 +48,6 @@ const char *nvme_command_string(struct ccb_nvmeio *nvmeio, char *, size_t);
 int nvme_status_sbuf(struct ccb_nvmeio *nvmeio, struct sbuf *sb);
 const void *nvme_get_identify_cntrl(struct cam_periph *);
 const void *nvme_get_identify_ns(struct cam_periph *);
+const void *nvme_get_identify_ns_zns(struct cam_periph *);
 
 #endif /* CAM_NVME_NVME_ALL_H */

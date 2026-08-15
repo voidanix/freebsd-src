@@ -151,8 +151,15 @@ struct disk_zone_rep_entry {
 	 (cond) == DISK_ZONE_COND_READONLY ||				\
 	 (cond) == DISK_ZONE_COND_FULL ||				\
 	 (cond) == DISK_ZONE_COND_OFFLINE)
+	/*
+	 * Number of usable logical blocks in the zone, for devices (e.g.
+	 * NVMe Zoned Namespaces) where this may be smaller than the zone
+	 * length.  Zero means the capacity was not reported; assume it is
+	 * equal to the zone length.
+	 */
+	uint64_t	zone_capacity;
 	/* XXX KDM padding space may not be a good idea inside the bio */
-	uint8_t		reserved[32];
+	uint8_t		reserved[24];
 };
 
 struct disk_zone_report {

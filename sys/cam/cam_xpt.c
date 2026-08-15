@@ -4901,6 +4901,7 @@ xpt_release_device(struct cam_ed *device)
 	free(device->serial_num, M_CAMXPT);
 	free(device->nvme_data, M_CAMXPT);
 	free(device->nvme_cdata, M_CAMXPT);
+	free(device->nvme_zns_data, M_CAMXPT);
 	taskqueue_enqueue(xsoftc.xpt_taskq, &device->device_destroy_task);
 }
 

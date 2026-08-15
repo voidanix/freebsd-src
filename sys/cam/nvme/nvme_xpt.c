@@ -81,6 +81,8 @@ PERIPHDRIVER_DECLARE(nvme_probe, nvme_probe_driver);
 typedef enum {
 	NVME_PROBE_IDENTIFY_CD,
 	NVME_PROBE_IDENTIFY_NS,
+	NVME_PROBE_IDENTIFY_NS_DESCS,
+	NVME_PROBE_IDENTIFY_NS_ZNS,
 	NVME_PROBE_DONE,
 	NVME_PROBE_INVALID
 } nvme_probe_action;
@@ -88,6 +90,8 @@ typedef enum {
 static char *nvme_probe_action_text[] = {
 	"NVME_PROBE_IDENTIFY_CD",
 	"NVME_PROBE_IDENTIFY_NS",
+	"NVME_PROBE_IDENTIFY_NS_DESCS",
+	"NVME_PROBE_IDENTIFY_NS_ZNS",
 	"NVME_PROBE_DONE",
 	"NVME_PROBE_INVALID"
 };
@@ -111,6 +115,8 @@ typedef struct {
 	union {
 		struct nvme_controller_data	cd;
 		struct nvme_namespace_data	ns;
+		uint8_t				nsdescs[NVME_NS_ID_DESC_LIST_SIZE];
+		struct nvme_zns_namespace_data	zns;
 	};
 	nvme_probe_action	action;
 	nvme_probe_flags	flags;
@@ -294,6 +300,29 @@ nvme_probe_start(struct cam_periph *periph, union ccb *start_ccb)
 		nvme_ns_cmd(nvmeio, NVME_OPC_IDENTIFY, lun,
 		    0, 0, 0, 0, 0, 0);
 		break;
+	case NVME_PROBE_IDENTIFY_NS_DESCS:
+		cam_fill_nvmeadmin(nvmeio,
+		    0,			/* retries */
+		    nvme_probe_done,	/* cbfcnp */
+		    CAM_DIR_IN,		/* flags */
+		    (uint8_t *)&softc->nsdescs,	/* data_ptr */
+		    sizeof(softc->nsdescs),	/* dxfer_len */
+		    30 * 1000); /* timeout 30s */
+		nvme_ns_cmd(nvmeio, NVME_OPC_IDENTIFY, lun,
+		    NVME_CNS_ID_NS_DESC_LIST, 0, 0, 0, 0, 0);
+		break;
+	case NVME_PROBE_IDENTIFY_NS_ZNS:
+		cam_fill_nvmeadmin(nvmeio,
+		    0,			/* retries */
+		    nvme_probe_done,	/* cbfcnp */
+		    CAM_DIR_IN,		/* flags */
+		    (uint8_t *)&softc->zns,	/* data_ptr */
+		    sizeof(softc->zns),		/* dxfer_len */
+		    30 * 1000); /* timeout 30s */
+		nvme_ns_cmd(nvmeio, NVME_OPC_IDENTIFY, lun,
+		    NVME_CNS_ID_NS_IOCS, (uint32_t)NVME_CSI_ZNS << 24,
+		    0, 0, 0, 0);
+		break;
 	default:
 		panic("nvme_probe_start: invalid action state 0x%x\n", softc->action);
 	}
@@ -320,6 +349,20 @@ nvme_probe_done(struct cam_periph *periph, union ccb *done_ccb)
 	priority = done_ccb->ccb_h.pinfo.priority;
 
 	if ((done_ccb->ccb_h.status & CAM_STATUS_MASK) != CAM_REQ_CMP) {
+		/*
+		 * Older controllers may not implement the namespace
+		 * indentification descriptor list and the I/O command set
+		 * specific identify data, with some SIMs rejecting the higher
+		 * CNS values.  Announce the device without that data instead of
+		 * failing the probe.
+		 */
+		if (softc->action == NVME_PROBE_IDENTIFY_NS_DESCS ||
+		    softc->action == NVME_PROBE_IDENTIFY_NS_ZNS) {
+			if ((done_ccb->ccb_h.status & CAM_DEV_QFRZN) != 0)
+				xpt_release_devq(path, /*count*/1,
+				    /*run_queue*/TRUE);
+			goto announce;
+		}
 		if (cam_periph_error(done_ccb,
 			0, softc->restart ? (SF_NO_RECOVERY | SF_NO_RETRY) : 0
 		    ) == ERESTART) {
@@ -348,7 +391,7 @@ device_fail:	if ((path->device->flags & CAM_DEV_UNCONFIGURED) == 0)
 		NVME_PROBE_SET_ACTION(softc, NVME_PROBE_INVALID);
 		found = 0;
 		goto done;
-	}
+}
 	if (softc->restart)
 		goto done;
 	switch (softc->action) {
@@ -457,20 +500,57 @@ device_fail:	if ((path->device->flags & CAM_DEV_UNCONFIGURED) == 0)
 			path->device->device_id_len = SVPD_DEVICE_ID_HDR_LEN + len;
 		}
 
-		if (periph->path->device->flags & CAM_DEV_UNCONFIGURED) {
-			path->device->flags &= ~CAM_DEV_UNCONFIGURED;
-			xpt_acquire_device(path->device);
-			done_ccb->ccb_h.func_code = XPT_GDEV_TYPE;
-			xpt_action(done_ccb);
-			xpt_async(AC_FOUND_DEVICE, path, done_ccb);
-		} else {
-			xpt_async(AC_GETDEV_CHANGED, path, NULL);
+		NVME_PROBE_SET_ACTION(softc, NVME_PROBE_IDENTIFY_NS_DESCS);
+		xpt_release_ccb(done_ccb);
+		xpt_schedule(periph, priority);
+		goto out;
+	case NVME_PROBE_IDENTIFY_NS_DESCS: {
+		uint8_t csi;
+
+		csi = nvme_ns_id_desc_list_csi(softc->nsdescs,
+		    sizeof(softc->nsdescs));
+		if (csi == NVME_CSI_ZNS) {
+			NVME_PROBE_SET_ACTION(softc, NVME_PROBE_IDENTIFY_NS_ZNS);
+			xpt_release_ccb(done_ccb);
+			xpt_schedule(periph, priority);
+			goto out;
 		}
-		NVME_PROBE_SET_ACTION(softc, NVME_PROBE_DONE);
+		free(path->device->nvme_zns_data, M_CAMXPT);
+		path->device->nvme_zns_data = NULL;
 		break;
+	}
+	case NVME_PROBE_IDENTIFY_NS_ZNS: {
+		struct nvme_zns_namespace_data *zns_data;
+
+		nvme_zns_namespace_data_swapbytes(&softc->zns);
+
+		zns_data = path->device->nvme_zns_data;
+		if (zns_data == NULL) {
+			zns_data = malloc(sizeof(*zns_data), M_CAMXPT,
+			    M_NOWAIT);
+			if (zns_data == NULL) {
+				xpt_print(path, "Can't allocate memory");
+				goto device_fail;
+			}
+		}
+		bcopy(&softc->zns, zns_data, sizeof(*zns_data));
+		path->device->nvme_zns_data = zns_data;
+		break;
+	}
 	default:
 		panic("nvme_probe_done: invalid action state 0x%x\n", softc->action);
 	}
+announce:
+	if (periph->path->device->flags & CAM_DEV_UNCONFIGURED) {
+		path->device->flags &= ~CAM_DEV_UNCONFIGURED;
+		xpt_acquire_device(path->device);
+		done_ccb->ccb_h.func_code = XPT_GDEV_TYPE;
+		xpt_action(done_ccb);
+		xpt_async(AC_FOUND_DEVICE, path, done_ccb);
+	} else {
+		xpt_async(AC_GETDEV_CHANGED, path, NULL);
+	}
+	NVME_PROBE_SET_ACTION(softc, NVME_PROBE_DONE);
 done:
 	if (softc->restart) {
 		softc->restart = false;
