@@ -3,23 +3,40 @@
 # Helpers for exercising GEOM classes on top of a gzoned provider.  Source this
 # in addition to geom_subr.sh.
 
-# Create a vnode-backed md large enough for four 256m zones.  gzoned reserves
-# space at the end of the provider for its metadata block and zone table, so an
-# exact multiple of the zone size (1024m) would lose a zone.
+# Attach a vnode-backed md large enough for four zones of $2 (default 256m).
+# gzoned reserves space at the end of the provider for its metadata block and
+# zone table, so an exact multiple of the zone size would lose a zone.  Sets
+# the variable named by $1 (default "md") to the md unit.
 zoned_backing_md()
 {
-	atf_check truncate -s 1025m backing_file
-	attach_md md -t vnode -f backing_file
+	local rv=${1:-md}
+	local zonesize=${2:-256m}
+
+	atf_check truncate -s $((4 * ${zonesize%m} + 1))m backing_file.$rv
+	attach_md $rv -t vnode -f backing_file.$rv
 }
 
-# Set up a gzoned provider on a fresh backing md.  Any argument is passed to
-# gzoned create as its conventional zone specification.
+# Set up a gzoned provider on a fresh backing md: $1 names the variable to
+# fill (default "md"), $2 the zone size (default 256m) and $3 the conventional
+# zone specification, if any.  Classes needing several components pass a
+# distinct name for each.
+zoned_attach_md_as()
+{
+	local rv=${1:-md}
+	local zonesize=${2:-256m}
+	local conv=$3
+	local unit
+
+	zoned_backing_md $rv $zonesize
+	eval "unit=\$$rv"
+	atf_check gzoned create -s $zonesize ${conv:+-c ${conv}} ${unit}
+}
+
+# Set up a single gzoned provider in ${md}.  Any argument is passed to gzoned
+# create as its conventional zone specification.
 zoned_attach_md()
 {
-	local conv=$1
-
-	zoned_backing_md
-	atf_check gzoned create -s 256m ${conv:+-c ${conv}} ${md}
+	zoned_attach_md_as md 256m "$1"
 }
 
 # Number of zones on $1 matching the report option $2, e.g. "nonwp".
