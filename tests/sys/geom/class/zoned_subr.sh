@@ -27,3 +27,17 @@ zoned_zone_count()
 {
 	zonectl -d $1 -c rz -o $2 -P summary | awk '/zones,/ {print $1}'
 }
+
+# Write pointer LBA of the zone containing LBA $2 on $1.
+zoned_zone_wp()
+{
+	zonectl -d $1 -c rz -l $2 -P script | \
+	    awk -F',' 'NR == 1 {gsub(/ /, "", $3); print $3}'
+}
+
+# Start LBA of zone number $2 on $1.
+zoned_zone_start()
+{
+	zonectl -d $1 -c rz -P script | \
+	    awk -F',' -v n=$(($2 + 1)) 'NR == n {gsub(/ /, "", $1); print $1}'
+}
