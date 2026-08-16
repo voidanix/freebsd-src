@@ -130,6 +130,7 @@ struct disk_zone_rep_entry {
 #define	DISK_ZONE_COND_IMPLICIT_OPEN	0x02
 #define	DISK_ZONE_COND_EXPLICIT_OPEN	0x03
 #define	DISK_ZONE_COND_CLOSED		0x04
+#define	DISK_ZONE_COND_INACTIVE		0x05
 #define	DISK_ZONE_COND_READONLY		0x0D
 #define	DISK_ZONE_COND_FULL		0x0E
 #define	DISK_ZONE_COND_OFFLINE		0x0F
@@ -139,6 +140,17 @@ struct disk_zone_rep_entry {
 	uint64_t	zone_length;
 	uint64_t	zone_start_lba;
 	uint64_t	write_pointer_lba;
+	/*
+	 * Only zone conditions that have a write pointer report one
+	 * here; ZBC and ZAC leave the field undefined otherwise, and
+	 * drives disagree on what they put in it.
+	 */
+#define	DISK_ZONE_WP_INVALID(cond)					\
+	((cond) == DISK_ZONE_COND_NOT_WP ||				\
+	 (cond) == DISK_ZONE_COND_INACTIVE ||				\
+	 (cond) == DISK_ZONE_COND_READONLY ||				\
+	 (cond) == DISK_ZONE_COND_FULL ||				\
+	 (cond) == DISK_ZONE_COND_OFFLINE)
 	/* XXX KDM padding space may not be a good idea inside the bio */
 	uint8_t		reserved[32];
 };
