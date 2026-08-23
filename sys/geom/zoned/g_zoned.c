@@ -835,7 +835,7 @@ g_zoned_zonecmd(struct bio *bp, struct g_zoned_softc *sc)
 		return;
 	}
 	default:
-		G_ZONED_LOGREQ(bp, "Unsupported zone command %u.",
+		G_ZONED_LOGREQLVL(1, bp, "Unsupported zone command %u.",
 		    args->zone_cmd);
 		g_io_deliver(bp, G_ZONED_EXTERR(bp, EOPNOTSUPP,
 		    "Unsupported zone command.  cmd=%ju",
@@ -875,8 +875,8 @@ g_zoned_write_check(struct g_zoned_softc *sc, struct bio *bp)
 		for (i = zno; i <= last; i++) {
 			if (i > zno && sc->sc_zones[i].zone_type !=
 			    DISK_ZONE_TYPE_CONVENTIONAL) {
-				G_ZONED_LOGREQ(bp, "Write crosses from a "
-				    "conventional into a sequential zone.");
+				G_ZONED_LOGREQLVL(1, bp, "Write crosses from "
+				    "a conventional into a sequential zone.");
 				return (G_ZONED_EXTERR(bp, EIO,
 				    "Write crosses from a conventional into a"
 				    " sequential zone.  lba=%ju zone=%ju",
@@ -886,7 +886,7 @@ g_zoned_write_check(struct g_zoned_softc *sc, struct bio *bp)
 			    DISK_ZONE_COND_READONLY ||
 			    sc->sc_zones[i].zone_condition ==
 			    DISK_ZONE_COND_OFFLINE) {
-				G_ZONED_LOGREQ(bp,
+				G_ZONED_LOGREQLVL(1, bp,
 				    "Write to a readonly/offline zone.");
 				return (G_ZONED_EXTERR(bp, EIO,
 				    "Write to a readonly or offline zone."
@@ -897,7 +897,7 @@ g_zoned_write_check(struct g_zoned_softc *sc, struct bio *bp)
 	} else {
 		if (z->zone_condition == DISK_ZONE_COND_READONLY ||
 		    z->zone_condition == DISK_ZONE_COND_OFFLINE) {
-			G_ZONED_LOGREQ(bp,
+			G_ZONED_LOGREQLVL(1, bp,
 			    "Write to a readonly/offline zone.");
 			return (G_ZONED_EXTERR(bp, EIO,
 			    "Write to a readonly or offline zone."
@@ -905,7 +905,8 @@ g_zoned_write_check(struct g_zoned_softc *sc, struct bio *bp)
 			    (uint64_t)z->zone_condition));
 		}
 		if (end > z->zone_start_lba + z->zone_length) {
-			G_ZONED_LOGREQ(bp, "Write crosses a zone boundary.");
+			G_ZONED_LOGREQLVL(1, bp,
+			    "Write crosses a zone boundary.");
 			return (G_ZONED_EXTERR(bp, EIO,
 			    "Write crosses a zone boundary.  end=%ju"
 			    " zoneend=%ju", (uint64_t)end,
@@ -918,7 +919,7 @@ g_zoned_write_check(struct g_zoned_softc *sc, struct bio *bp)
 		 */
 		if (z->zone_condition == DISK_ZONE_COND_FULL ||
 		    lba != z->write_pointer_lba) {
-			G_ZONED_LOGREQ(bp,
+			G_ZONED_LOGREQLVL(1, bp,
 			    "Out-of-order write to zone %u (lba %ju, wp %ju).",
 			    zno, (uintmax_t)lba,
 			    (uintmax_t)z->write_pointer_lba);
@@ -935,7 +936,7 @@ g_zoned_write_check(struct g_zoned_softc *sc, struct bio *bp)
 		if (!g_zoned_cond_is_open(z->zone_condition) &&
 		    end < z->zone_start_lba + z->zone_length &&
 		    !g_zoned_open_room(sc)) {
-			G_ZONED_LOGREQ(bp,
+			G_ZONED_LOGREQLVL(1, bp,
 			    "Cannot implicitly open zone %u:"
 			    " open-zone limit reached.", zno);
 			return (G_ZONED_EXTERR(bp, ENOSPC,
@@ -985,7 +986,7 @@ g_zoned_read_check(struct g_zoned_softc *sc, struct bio *bp)
 		for (i = zno + 1; i <= last; i++) {
 			if (sc->sc_zones[i].zone_type !=
 			    DISK_ZONE_TYPE_CONVENTIONAL) {
-				G_ZONED_LOGREQ(bp, "Read crosses from a "
+				G_ZONED_LOGREQLVL(1, bp, "Read crosses from a "
 				    "conventional into a sequential zone.");
 				return (G_ZONED_EXTERR(bp, EIO,
 				    "Read crosses from a conventional into a"
@@ -995,14 +996,15 @@ g_zoned_read_check(struct g_zoned_softc *sc, struct bio *bp)
 		}
 	} else {
 		if (end > z->zone_start_lba + z->zone_length) {
-			G_ZONED_LOGREQ(bp, "Read crosses a zone boundary.");
+			G_ZONED_LOGREQLVL(1, bp,
+			    "Read crosses a zone boundary.");
 			return (G_ZONED_EXTERR(bp, EIO,
 			    "Read crosses a zone boundary.  end=%ju"
 			    " zoneend=%ju", (uint64_t)end,
 			    (uint64_t)(z->zone_start_lba + z->zone_length)));
 		}
 		if (end > z->write_pointer_lba) {
-			G_ZONED_LOGREQ(bp,
+			G_ZONED_LOGREQLVL(1, bp,
 			    "Read above the write pointer of zone %u"
 			    " (lba %ju, wp %ju).", zno, (uintmax_t)lba,
 			    (uintmax_t)z->write_pointer_lba);
