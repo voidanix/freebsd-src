@@ -96,6 +96,7 @@ zoned_parse_conv(struct gctl_req *req, const char *spec, uint32_t nzones,
 {
 	char *buf, *ep, *sp, *tok;
 	unsigned long first, last;
+	uint32_t i;
 
 	md->md_nconv = 0;
 	if (*spec == '\0')
@@ -141,6 +142,17 @@ zoned_parse_conv(struct gctl_req *req, const char *spec, uint32_t nzones,
 			    "Zone %lu does not exist (zones 0-%u).", last,
 			    nzones - 1);
 			goto fail;
+		}
+		for (i = 0; i < md->md_nconv; i++) {
+			uint32_t ofirst, olast;
+
+			ofirst = md->md_conv[i].cr_first;
+			olast = ofirst + md->md_conv[i].cr_count - 1;
+			if (first <= olast && ofirst <= last) {
+				gctl_error(req, "Zone range %lu-%lu overlaps "
+				    "%u-%u.", first, last, ofirst, olast);
+				goto fail;
+			}
 		}
 		md->md_conv[md->md_nconv].cr_first = first;
 		md->md_conv[md->md_nconv].cr_count = last - first + 1;
