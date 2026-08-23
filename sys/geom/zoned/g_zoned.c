@@ -952,8 +952,6 @@ g_zoned_write_check(struct g_zoned_softc *sc, struct bio *bp)
 		g_zoned_mark_dirty(sc, zno);
 	}
 
-	sc->sc_writes++;
-	sc->sc_wrotebytes += bp->bio_length;
 	return (0);
 }
 
@@ -1071,11 +1069,14 @@ g_zoned_start(struct bio *bp)
 	case BIO_WRITE:
 		mtx_lock(&sc->sc_lock);
 		error = g_zoned_write_check(sc, bp);
-		mtx_unlock(&sc->sc_lock);
 		if (error != 0) {
+			mtx_unlock(&sc->sc_lock);
 			g_io_deliver(bp, error);
 			return;
 		}
+		sc->sc_writes++;
+		sc->sc_wrotebytes += bp->bio_length;
+		mtx_unlock(&sc->sc_lock);
 		break;
 	case BIO_READ:
 		mtx_lock(&sc->sc_lock);
