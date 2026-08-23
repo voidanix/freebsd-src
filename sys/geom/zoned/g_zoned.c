@@ -325,11 +325,16 @@ g_zoned_load_table(struct g_zoned_softc *sc, struct g_consumer *cp)
 struct g_zoned_flush {
 	struct bio *fl_orig;	  /* Original BIO_FLUSH. */
 	struct g_consumer *fl_cp; /* Where to send the I/O. */
+	struct g_zoned_softc *fl_sc;
 	u_char *fl_buf;		  /* Snapshot of dirty sectors. */
 	off_t fl_off;		  /* Disk offset of first sector. */
 	off_t fl_total;		  /* Bytes to write. */
 	off_t fl_done;		  /* Bytes written so far. */
 	u_int fl_secsize;
+	/* Dirty state the snapshot took: to put back if the write fails. */
+	uint32_t fl_dirtylo;
+	uint32_t fl_dirtyhi;
+	bool fl_hdrdirty;
 };
 
 static void g_zoned_flush_step(struct g_zoned_flush *fc);
@@ -355,7 +360,20 @@ g_zoned_flush_write_done(struct bio *bp)
 
 	g_destroy_bio(bp);
 	if (error != 0) {
+		struct g_zoned_softc *sc = fc->fl_sc;
+
 		G_ZONED_DEBUG(0, "Zone table write failed (error=%d).", error);
+		/*
+		 * Nothing reached the medium, thus the state the snapshot
+		 * cleared is still only in memory.  Mark it dirty again,
+		 * widening whatever has been dirtied since, so that the next
+		 * flush tries once more instead of leaving the table stale.
+		 */
+		mtx_lock(&sc->sc_lock);
+		g_zoned_mark_dirty(sc, fc->fl_dirtylo);
+		g_zoned_mark_dirty(sc, fc->fl_dirtyhi);
+		sc->sc_hdrdirty |= fc->fl_hdrdirty;
+		mtx_unlock(&sc->sc_lock);
 		g_free(fc->fl_buf);
 		g_io_deliver(fc->fl_orig, error);
 		g_free(fc);
@@ -465,6 +483,9 @@ g_zoned_flush_begin(struct g_zoned_softc *sc, struct g_geom *gp,
 		return (false);
 
 	mtx_lock(&sc->sc_lock);
+	fc->fl_dirtylo = sc->sc_dirtylo;
+	fc->fl_dirtyhi = sc->sc_dirtyhi;
+	fc->fl_hdrdirty = sc->sc_hdrdirty;
 	buf = g_zoned_encode_dirty(sc, &off, &total);
 	mtx_unlock(&sc->sc_lock);
 	if (buf == NULL) {
@@ -474,6 +495,7 @@ g_zoned_flush_begin(struct g_zoned_softc *sc, struct g_geom *gp,
 
 	fc->fl_orig = bp;
 	fc->fl_cp = cp;
+	fc->fl_sc = sc;
 	fc->fl_buf = buf;
 	fc->fl_off = off;
 	fc->fl_total = total;
