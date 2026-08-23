@@ -956,9 +956,10 @@ g_zoned_write_check(struct g_zoned_softc *sc, struct bio *bp)
 }
 
 /*
- * Validate a read against the zone model for devices created without
- * unrestricted-read (URSWRZ) support. Reads may only span conventional zones,
- * and reads in a sequential zone must end at or below the write pointer.
+ * Validate a read against the zone model.  A read may never reach a zone of
+ * a different type than the one it starts in, whatever URSWRZ says; only
+ * spanning several sequential zones and reading above the write pointer depend
+ * on it.
  */
 static int
 g_zoned_read_check(struct g_zoned_softc *sc, struct bio *bp)
@@ -978,38 +979,37 @@ g_zoned_read_check(struct g_zoned_softc *sc, struct bio *bp)
 
 	zno = g_zoned_zoneno(sc, lba);
 	z = &sc->sc_zones[zno];
+	last = (end > lba) ? g_zoned_zoneno(sc, end - 1) : zno;
 
-	if (z->zone_type == DISK_ZONE_TYPE_CONVENTIONAL) {
-		last = (end > lba) ? g_zoned_zoneno(sc, end - 1) : zno;
-		for (i = zno + 1; i <= last; i++) {
-			if (sc->sc_zones[i].zone_type !=
-			    DISK_ZONE_TYPE_CONVENTIONAL) {
-				G_ZONED_LOGREQLVL(1, bp, "Read crosses from a "
-				    "conventional into a sequential zone.");
-				return (G_ZONED_EXTERR(bp, EIO,
-				    "Read crosses from a conventional into a"
-				    " sequential zone.  lba=%ju zone=%ju",
-				    (uint64_t)lba, (uint64_t)i));
-			}
-		}
-	} else {
-		if (end > z->zone_start_lba + z->zone_length) {
-			G_ZONED_LOGREQLVL(1, bp,
-			    "Read crosses a zone boundary.");
+	for (i = zno + 1; i <= last; i++) {
+		if (sc->sc_zones[i].zone_type != z->zone_type) {
+			G_ZONED_LOGREQLVL(1, bp, "Read crosses into a zone of "
+			    "a different type.");
 			return (G_ZONED_EXTERR(bp, EIO,
-			    "Read crosses a zone boundary.  end=%ju"
-			    " zoneend=%ju", (uint64_t)end,
-			    (uint64_t)(z->zone_start_lba + z->zone_length)));
+			    "Read crosses into a zone of a different type."
+			    "  lba=%ju zone=%ju", (uint64_t)lba,
+			    (uint64_t)i));
 		}
-		if (end > z->write_pointer_lba) {
-			G_ZONED_LOGREQLVL(1, bp,
-			    "Read above the write pointer of zone %u"
-			    " (lba %ju, wp %ju).", zno, (uintmax_t)lba,
-			    (uintmax_t)z->write_pointer_lba);
-			return (G_ZONED_EXTERR(bp, EIO,
-			    "Read above the write pointer.  end=%ju wp=%ju",
-			    (uint64_t)end, (uint64_t)z->write_pointer_lba));
-		}
+	}
+
+	if (!sc->sc_rdrestrict || z->zone_type == DISK_ZONE_TYPE_CONVENTIONAL)
+		return (0);
+
+	if (end > z->zone_start_lba + z->zone_length) {
+		G_ZONED_LOGREQLVL(1, bp, "Read crosses a zone boundary.");
+		return (G_ZONED_EXTERR(bp, EIO,
+		    "Read crosses a zone boundary.  end=%ju zoneend=%ju",
+		    (uint64_t)end,
+		    (uint64_t)(z->zone_start_lba + z->zone_length)));
+	}
+	if (end > z->write_pointer_lba) {
+		G_ZONED_LOGREQLVL(1, bp,
+		    "Read above the write pointer of zone %u (lba %ju,"
+		    " wp %ju).", zno, (uintmax_t)lba,
+		    (uintmax_t)z->write_pointer_lba);
+		return (G_ZONED_EXTERR(bp, EIO,
+		    "Read above the write pointer.  end=%ju wp=%ju",
+		    (uint64_t)end, (uint64_t)z->write_pointer_lba));
 	}
 	return (0);
 }
@@ -1080,13 +1080,11 @@ g_zoned_start(struct bio *bp)
 		break;
 	case BIO_READ:
 		mtx_lock(&sc->sc_lock);
-		if (sc->sc_rdrestrict) {
-			error = g_zoned_read_check(sc, bp);
-			if (error != 0) {
-				mtx_unlock(&sc->sc_lock);
-				g_io_deliver(bp, error);
-				return;
-			}
+		error = g_zoned_read_check(sc, bp);
+		if (error != 0) {
+			mtx_unlock(&sc->sc_lock);
+			g_io_deliver(bp, error);
+			return;
 		}
 		sc->sc_reads++;
 		sc->sc_readbytes += bp->bio_length;

@@ -288,8 +288,41 @@ unrestricted_reads_body()
 	# Reading an empty sequential zone is fine.
 	atf_check -e ignore \
 	    dd if=/dev/${md}.zoned of=/dev/null bs=512 count=1
+	# So is one 768k read straddling the 256m mark, as in write_boundary:
+	# spanning zones of the same type is what URSWRZ lifts.
+	atf_check -e ignore \
+	    dd if=/dev/${md}.zoned of=/dev/null bs=768k iseek=341 count=1
 }
 unrestricted_reads_cleanup()
+{
+	gzoned_test_cleanup
+}
+
+atf_test_case read_zone_types cleanup
+read_zone_types_head()
+{
+	atf_set "descr" \
+	    "Reads may not cross between zone types even when unrestricted"
+	atf_set "require.user" "root"
+}
+read_zone_types_body()
+{
+	gzoned_test_setup
+
+	zoned_backing_md
+	atf_check gzoned create -s 256m -c 0 ${md}
+	atf_check -o match:"URSWRZ.*: Yes" \
+	    zonectl -d /dev/${md}.zoned -c params
+
+	# The 768k read straddling the 256m mark reaches the kernel as one
+	# bio, running from a conventional zone into the sequential.
+	atf_check -s not-exit:0 -e ignore \
+	    dd if=/dev/${md}.zoned of=/dev/null bs=768k iseek=341 count=1
+	# Preceding block lies within the conventional zone: it's fine.
+	atf_check -e ignore \
+	    dd if=/dev/${md}.zoned of=/dev/null bs=768k iseek=340 count=1
+}
+read_zone_types_cleanup()
 {
 	gzoned_test_cleanup
 }
@@ -740,6 +773,7 @@ atf_init_test_cases()
 	atf_add_test_case reset_wp_empty
 	atf_add_test_case reset_wp_finished
 	atf_add_test_case unrestricted_reads
+	atf_add_test_case read_zone_types
 	atf_add_test_case restricted_reads
 	atf_add_test_case write_at_wp
 	atf_add_test_case write_out_of_order
