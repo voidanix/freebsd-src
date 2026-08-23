@@ -848,13 +848,15 @@ g_zoned_zonecmd(struct bio *bp, struct g_zoned_softc *sc)
  * Validate a write against the zone model, advancing the write pointer.
  */
 static int
-g_zoned_write_check(struct g_zoned_softc *sc, struct bio *bp)
+g_zoned_write_check(struct g_zoned_softc *sc, struct bio *bp, uint8_t *oldcond)
 {
 	struct disk_zone_rep_entry *z;
 	uint64_t lba, end;
 	uint32_t i, last, zno;
 
 	mtx_assert(&sc->sc_lock, MA_OWNED);
+
+	*oldcond = DISK_ZONE_COND_NOT_WP;
 
 	lba = bp->bio_offset / sc->sc_secsize;
 	end = (bp->bio_offset + bp->bio_length) / sc->sc_secsize;
@@ -944,6 +946,7 @@ g_zoned_write_check(struct g_zoned_softc *sc, struct bio *bp)
 			    (uint64_t)zno, (uint64_t)sc->sc_maxopen));
 		}
 
+		*oldcond = z->zone_condition;
 		z->write_pointer_lba = end;
 		if (z->write_pointer_lba >= z->zone_start_lba + z->zone_length)
 			g_zoned_set_cond(sc, z, DISK_ZONE_COND_FULL);
@@ -1017,7 +1020,7 @@ g_zoned_read_check(struct g_zoned_softc *sc, struct bio *bp)
 /*
  * A failed backing write leaves the data missing, so retract the optimistic
  * write-pointer advance, as long as no later write has moved the pointer
- * further.
+ * further.  The zone rolls back to the condition the write found it in.
  */
 static void
 g_zoned_write_done(struct bio *cbp)
@@ -1040,9 +1043,7 @@ g_zoned_write_done(struct bio *cbp)
 		    z->write_pointer_lba == end) {
 			z->write_pointer_lba = lba;
 			g_zoned_set_cond(sc, z,
-			    (lba == z->zone_start_lba) ?
-				DISK_ZONE_COND_EMPTY :
-				DISK_ZONE_COND_IMPLICIT_OPEN);
+			    (uint8_t)(uintptr_t)cbp->bio_caller1);
 			g_zoned_mark_dirty(sc, zno);
 		}
 		mtx_unlock(&sc->sc_lock);
@@ -1057,6 +1058,7 @@ g_zoned_start(struct bio *bp)
 	struct g_geom *gp;
 	struct bio *cbp;
 	int error;
+	uint8_t oldcond = DISK_ZONE_COND_NOT_WP;
 
 	gp = bp->bio_to->geom;
 	sc = gp->softc;
@@ -1068,7 +1070,7 @@ g_zoned_start(struct bio *bp)
 		return;
 	case BIO_WRITE:
 		mtx_lock(&sc->sc_lock);
-		error = g_zoned_write_check(sc, bp);
+		error = g_zoned_write_check(sc, bp, &oldcond);
 		if (error != 0) {
 			mtx_unlock(&sc->sc_lock);
 			g_io_deliver(bp, error);
@@ -1117,8 +1119,11 @@ g_zoned_start(struct bio *bp)
 		g_io_deliver(bp, ENOMEM);
 		return;
 	}
-	cbp->bio_done = (bp->bio_cmd == BIO_WRITE) ? g_zoned_write_done :
-						     g_std_done;
+	if (bp->bio_cmd == BIO_WRITE) {
+		cbp->bio_done = g_zoned_write_done;
+		cbp->bio_caller1 = (void *)(uintptr_t)oldcond;
+	} else
+		cbp->bio_done = g_std_done;
 	G_ZONED_LOGREQ(cbp, "Sending request.");
 	g_io_request(cbp, LIST_FIRST(&gp->consumer));
 }
