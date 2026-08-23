@@ -23,11 +23,14 @@
  *     flush may be rolled back by an unclean shutdown.
  */
 
+#define	EXTERR_CATEGORY	EXTERR_CAT_GEOMZONED
+
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/bio.h>
 #include <sys/disk_zone.h>
 #include <sys/endian.h>
+#include <sys/exterrvar.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
@@ -50,6 +53,11 @@ static SYSCTL_NODE(_kern_geom, OID_AUTO, zoned, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
 static u_int g_zoned_debug = 0;
 SYSCTL_UINT(_kern_geom_zoned, OID_AUTO, debug, CTLFLAG_RW, &g_zoned_debug, 0,
     "Debug level");
+
+#define	G_ZONED_EXTERR(bp, error, ...)	({				\
+	(bp)->bio_flags |= BIO_EXTERR;					\
+	EXTERROR_KE(&(bp)->bio_exterr, (error), __VA_ARGS__);		\
+})
 
 static g_access_t g_zoned_access;
 static g_ctl_req_t g_zoned_config;
@@ -658,7 +666,9 @@ g_zoned_zonecmd(struct bio *bp, struct g_zoned_softc *sc)
 		uint32_t filled, zno;
 
 		if (!g_zoned_rep_option_valid(rep->rep_options)) {
-			g_io_deliver(bp, EINVAL);
+			g_io_deliver(bp, G_ZONED_EXTERR(bp, EINVAL,
+			    "Unsupported reporting option.  opt=%ju",
+			    (uint64_t)rep->rep_options));
 			return;
 		}
 
@@ -702,7 +712,10 @@ g_zoned_zonecmd(struct bio *bp, struct g_zoned_softc *sc)
 			limit = sc->sc_nzones;
 		} else {
 			if (rwp->id >= sc->sc_maxlba) {
-				g_io_deliver(bp, EINVAL);
+				g_io_deliver(bp, G_ZONED_EXTERR(bp, EINVAL,
+				    "Zone ID past the last LBA.  id=%ju"
+				    " maxlba=%ju", (uint64_t)rwp->id,
+				    (uint64_t)sc->sc_maxlba));
 				return;
 			}
 			first = g_zoned_zoneno(sc, rwp->id);
@@ -725,7 +738,11 @@ g_zoned_zonecmd(struct bio *bp, struct g_zoned_softc *sc)
 					nclosed++;
 			if (sc->sc_nopen + nclosed > sc->sc_maxopen) {
 				mtx_unlock(&sc->sc_lock);
-				g_io_deliver(bp, ENOSPC);
+				g_io_deliver(bp, G_ZONED_EXTERR(bp, ENOSPC,
+				    "Opening all zones exceeds the open-zone"
+				    " limit.  need=%ju maxopen=%ju",
+				    (uint64_t)(sc->sc_nopen + nclosed),
+				    (uint64_t)sc->sc_maxopen));
 				return;
 			}
 		}
@@ -745,7 +762,10 @@ g_zoned_zonecmd(struct bio *bp, struct g_zoned_softc *sc)
 				if (all)
 					continue;
 				mtx_unlock(&sc->sc_lock);
-				g_io_deliver(bp, EINVAL);
+				g_io_deliver(bp, G_ZONED_EXTERR(bp, EINVAL,
+				    "Zone has no write pointer to manage."
+				    "  zone=%ju cond=%ju", (uint64_t)i,
+				    (uint64_t)z->zone_condition));
 				return;
 			}
 			switch (args->zone_cmd) {
@@ -765,7 +785,11 @@ g_zoned_zonecmd(struct bio *bp, struct g_zoned_softc *sc)
 				if (!g_zoned_cond_is_open(z->zone_condition) &&
 				    !g_zoned_open_room(sc)) {
 					mtx_unlock(&sc->sc_lock);
-					g_io_deliver(bp, ENOSPC);
+					g_io_deliver(bp, G_ZONED_EXTERR(bp,
+					    ENOSPC, "Open-zone limit reached."
+					    "  zone=%ju maxopen=%ju",
+					    (uint64_t)i,
+					    (uint64_t)sc->sc_maxopen));
 					return;
 				}
 				g_zoned_set_cond(sc, z,
@@ -813,7 +837,9 @@ g_zoned_zonecmd(struct bio *bp, struct g_zoned_softc *sc)
 	default:
 		G_ZONED_LOGREQ(bp, "Unsupported zone command %u.",
 		    args->zone_cmd);
-		g_io_deliver(bp, EOPNOTSUPP);
+		g_io_deliver(bp, G_ZONED_EXTERR(bp, EOPNOTSUPP,
+		    "Unsupported zone command.  cmd=%ju",
+		    (uint64_t)args->zone_cmd));
 		return;
 	}
 }
@@ -833,7 +859,9 @@ g_zoned_write_check(struct g_zoned_softc *sc, struct bio *bp)
 	lba = bp->bio_offset / sc->sc_secsize;
 	end = (bp->bio_offset + bp->bio_length) / sc->sc_secsize;
 	if (end > sc->sc_maxlba)
-		return (EIO);
+		return (G_ZONED_EXTERR(bp, EIO,
+		    "Write past the last LBA.  end=%ju maxlba=%ju",
+		    (uint64_t)end, (uint64_t)sc->sc_maxlba));
 
 	zno = g_zoned_zoneno(sc, lba);
 	z = &sc->sc_zones[zno];
@@ -849,7 +877,10 @@ g_zoned_write_check(struct g_zoned_softc *sc, struct bio *bp)
 			    DISK_ZONE_TYPE_CONVENTIONAL) {
 				G_ZONED_LOGREQ(bp, "Write crosses from a "
 				    "conventional into a sequential zone.");
-				return (EIO);
+				return (G_ZONED_EXTERR(bp, EIO,
+				    "Write crosses from a conventional into a"
+				    " sequential zone.  lba=%ju zone=%ju",
+				    (uint64_t)lba, (uint64_t)i));
 			}
 			if (sc->sc_zones[i].zone_condition ==
 			    DISK_ZONE_COND_READONLY ||
@@ -857,7 +888,10 @@ g_zoned_write_check(struct g_zoned_softc *sc, struct bio *bp)
 			    DISK_ZONE_COND_OFFLINE) {
 				G_ZONED_LOGREQ(bp,
 				    "Write to a readonly/offline zone.");
-				return (EIO);
+				return (G_ZONED_EXTERR(bp, EIO,
+				    "Write to a readonly or offline zone."
+				    "  zone=%ju cond=%ju", (uint64_t)i,
+				    (uint64_t)sc->sc_zones[i].zone_condition));
 			}
 		}
 	} else {
@@ -865,11 +899,17 @@ g_zoned_write_check(struct g_zoned_softc *sc, struct bio *bp)
 		    z->zone_condition == DISK_ZONE_COND_OFFLINE) {
 			G_ZONED_LOGREQ(bp,
 			    "Write to a readonly/offline zone.");
-			return (EIO);
+			return (G_ZONED_EXTERR(bp, EIO,
+			    "Write to a readonly or offline zone."
+			    "  zone=%ju cond=%ju", (uint64_t)zno,
+			    (uint64_t)z->zone_condition));
 		}
 		if (end > z->zone_start_lba + z->zone_length) {
 			G_ZONED_LOGREQ(bp, "Write crosses a zone boundary.");
-			return (EIO);
+			return (G_ZONED_EXTERR(bp, EIO,
+			    "Write crosses a zone boundary.  end=%ju"
+			    " zoneend=%ju", (uint64_t)end,
+			    (uint64_t)(z->zone_start_lba + z->zone_length)));
 		}
 
 		/*
@@ -882,7 +922,9 @@ g_zoned_write_check(struct g_zoned_softc *sc, struct bio *bp)
 			    "Out-of-order write to zone %u (lba %ju, wp %ju).",
 			    zno, (uintmax_t)lba,
 			    (uintmax_t)z->write_pointer_lba);
-			return (EIO);
+			return (G_ZONED_EXTERR(bp, EIO,
+			    "Write pointer violation.  lba=%ju wp=%ju",
+			    (uint64_t)lba, (uint64_t)z->write_pointer_lba));
 		}
 
 		/*
@@ -896,7 +938,9 @@ g_zoned_write_check(struct g_zoned_softc *sc, struct bio *bp)
 			G_ZONED_LOGREQ(bp,
 			    "Cannot implicitly open zone %u:"
 			    " open-zone limit reached.", zno);
-			return (ENOSPC);
+			return (G_ZONED_EXTERR(bp, ENOSPC,
+			    "Open-zone limit reached.  zone=%ju maxopen=%ju",
+			    (uint64_t)zno, (uint64_t)sc->sc_maxopen));
 		}
 
 		z->write_pointer_lba = end;
@@ -929,7 +973,9 @@ g_zoned_read_check(struct g_zoned_softc *sc, struct bio *bp)
 	lba = bp->bio_offset / sc->sc_secsize;
 	end = (bp->bio_offset + bp->bio_length) / sc->sc_secsize;
 	if (end > sc->sc_maxlba)
-		return (EIO);
+		return (G_ZONED_EXTERR(bp, EIO,
+		    "Read past the last LBA.  end=%ju maxlba=%ju",
+		    (uint64_t)end, (uint64_t)sc->sc_maxlba));
 
 	zno = g_zoned_zoneno(sc, lba);
 	z = &sc->sc_zones[zno];
@@ -941,20 +987,28 @@ g_zoned_read_check(struct g_zoned_softc *sc, struct bio *bp)
 			    DISK_ZONE_TYPE_CONVENTIONAL) {
 				G_ZONED_LOGREQ(bp, "Read crosses from a "
 				    "conventional into a sequential zone.");
-				return (EIO);
+				return (G_ZONED_EXTERR(bp, EIO,
+				    "Read crosses from a conventional into a"
+				    " sequential zone.  lba=%ju zone=%ju",
+				    (uint64_t)lba, (uint64_t)i));
 			}
 		}
 	} else {
 		if (end > z->zone_start_lba + z->zone_length) {
 			G_ZONED_LOGREQ(bp, "Read crosses a zone boundary.");
-			return (EIO);
+			return (G_ZONED_EXTERR(bp, EIO,
+			    "Read crosses a zone boundary.  end=%ju"
+			    " zoneend=%ju", (uint64_t)end,
+			    (uint64_t)(z->zone_start_lba + z->zone_length)));
 		}
 		if (end > z->write_pointer_lba) {
 			G_ZONED_LOGREQ(bp,
 			    "Read above the write pointer of zone %u"
 			    " (lba %ju, wp %ju).", zno, (uintmax_t)lba,
 			    (uintmax_t)z->write_pointer_lba);
-			return (EIO);
+			return (G_ZONED_EXTERR(bp, EIO,
+			    "Read above the write pointer.  end=%ju wp=%ju",
+			    (uint64_t)end, (uint64_t)z->write_pointer_lba));
 		}
 	}
 	return (0);
@@ -1049,7 +1103,9 @@ g_zoned_start(struct bio *bp)
 		 * Zoned device have no unmap; sequential zones are reclaimed by
 		 * resetting the write pointer instead.
 		 */
-		g_io_deliver(bp, EOPNOTSUPP);
+		g_io_deliver(bp, G_ZONED_EXTERR(bp, EOPNOTSUPP,
+		    "Zoned providers have no unmap; reset the write pointer"
+		    " instead."));
 		return;
 	default:
 		break;
