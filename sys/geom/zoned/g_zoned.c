@@ -17,8 +17,8 @@
  *     arrival and re-creates the zoned device automatically.
  *   - The sectors just before it hold the per-zone state (condition + write
  *     pointer). That table is read at taste time and rewritten lazily.
- *     Zone-state changes are committed to disk on BIO_FLUSH (and the table is
- *     also flushed when zone-management commands run), mirroring a drive whose
+ *     Zone-state changes, zone-management commands included, only mark the
+ *     table dirty; BIO_FLUSH is what commits them, mirroring a drive whose
  *     zone state is volatile until a cache flush. Changes since the last
  *     flush may be rolled back by an unclean shutdown.
  */
