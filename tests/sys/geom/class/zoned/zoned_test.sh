@@ -757,6 +757,65 @@ delete_rejected_cleanup()
 	gzoned_test_cleanup
 }
 
+atf_test_case conventional_overlap cleanup
+conventional_overlap_head()
+{
+	atf_set "descr" "gzoned create -c refuses overlapping zone ranges"
+	atf_set "require.user" "root"
+}
+conventional_overlap_body()
+{
+	gzoned_test_setup
+
+	zoned_backing_md
+	atf_check -s not-exit:0 -e match:"overlaps" \
+	    gzoned create -s 256m -c 0-2,1-3 ${md}
+	atf_check test ! -c /dev/${md}.zoned
+	atf_check -s not-exit:0 -e match:"overlaps" \
+	    gzoned create -s 256m -c 1,1 ${md}
+	atf_check -s not-exit:0 -e match:"overlaps" \
+	    gzoned create -s 256m -c 0-3,2 ${md}
+	atf_check gzoned create -s 256m -c 0-1,2-3 ${md}
+	atf_check_equal "4" "$(zone_count nonwp)"
+}
+conventional_overlap_cleanup()
+{
+	gzoned_test_cleanup
+}
+
+atf_test_case resize cleanup
+resize_head()
+{
+	atf_set "descr" "Resizing the backing provider destroys the device"
+	atf_set "require.user" "root"
+}
+resize_body()
+{
+	gzoned_test_setup
+
+	zoned_backing_md
+	atf_check gzoned create -s 256m ${md}
+	atf_check test -c /dev/${md}.zoned
+
+	# The zone layout is fixed at creation, with the metadata sitting at the
+	# end of the provider: neither survives the provider changing size. The
+	# device is destroyed rather than left describing a disk that is no
+	# longer there.
+	atf_check truncate -s 2049m backing_file
+	atf_check mdconfig -r -u ${md} -s 2049m
+	wait_dev_gone /dev/${md}.zoned
+
+	# Stale metadata is out of reach of the taste, at its new size: the
+	# device does not come back on its own.
+	true > /dev/${md}
+	sleep 1
+	atf_check test ! -c /dev/${md}.zoned
+}
+resize_cleanup()
+{
+	gzoned_test_cleanup
+}
+
 atf_init_test_cases()
 {
 	atf_add_test_case create
@@ -766,6 +825,7 @@ atf_init_test_cases()
 	atf_add_test_case conventional_single
 	atf_add_test_case conventional_range
 	atf_add_test_case conventional_ranges
+	atf_add_test_case conventional_overlap
 	atf_add_test_case all_zones_same
 	atf_add_test_case zone_size
 	atf_add_test_case reset_wp
@@ -789,4 +849,5 @@ atf_init_test_cases()
 	atf_add_test_case stop_force
 	atf_add_test_case fault_injection
 	atf_add_test_case delete_rejected
+	atf_add_test_case resize
 }
