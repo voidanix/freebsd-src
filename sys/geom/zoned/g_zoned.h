@@ -97,55 +97,68 @@ struct g_zoned_metadata {
 	uint32_t	md_sectorsize;	/* Provider sector size in bytes. */
 	uint64_t	md_provsize;	/* Provider size in bytes. */
 	uint32_t	md_nconv;	/* Conventional ranges in use. */
+	/* Pads md_conv to the alignment its 64-bit members already need. */
+	uint32_t	md_reserved;
 	struct g_zoned_convrange md_conv[G_ZONED_MAXCONV];
 	uint32_t	md_flags;	/* G_ZONED_MD_* flags. */
 	uint32_t	md_maxopen;	/* Open zone limit, 0 = unlimited. */
 };
+_Static_assert(sizeof(struct g_zoned_metadata) == 320,
+    "on-disk metadata layout changed");
+_Static_assert(__offsetof(struct g_zoned_metadata, md_conv) == 56,
+    "on-disk metadata layout changed");
 
+/*
+ * The on-disk image has the same layout as the struct, so marshalling is a
+ * matter of byte order.  The image is copied in and out rather than cast to,
+ * as the buffers holding it are only guaranteed to be byte aligned.
+ */
 static __inline void
 zoned_metadata_encode(const struct g_zoned_metadata *md, u_char *data)
 {
-	u_char *p;
+	struct g_zoned_metadata d;
 	u_int i;
 
-	bcopy(md->md_magic, data, sizeof(md->md_magic));
-	le32enc(data + 16, md->md_version);
-	le32enc(data + 20, md->md_id);
-	le64enc(data + 24, md->md_zonesize);
-	le32enc(data + 32, md->md_nzones);
-	le32enc(data + 36, md->md_sectorsize);
-	le64enc(data + 40, md->md_provsize);
-	le32enc(data + 48, md->md_nconv);
-	p = data + 52;
-	for (i = 0; i < G_ZONED_MAXCONV; i++, p += 16) {
-		le64enc(p, md->md_conv[i].cr_first);
-		le64enc(p + 8, md->md_conv[i].cr_count);
+	memset(&d, 0, sizeof(d));
+	memcpy(d.md_magic, md->md_magic, sizeof(d.md_magic));
+	d.md_version = htole32(md->md_version);
+	d.md_id = htole32(md->md_id);
+	d.md_zonesize = htole64(md->md_zonesize);
+	d.md_nzones = htole32(md->md_nzones);
+	d.md_sectorsize = htole32(md->md_sectorsize);
+	d.md_provsize = htole64(md->md_provsize);
+	d.md_nconv = htole32(md->md_nconv);
+	for (i = 0; i < G_ZONED_MAXCONV; i++) {
+		d.md_conv[i].cr_first = htole64(md->md_conv[i].cr_first);
+		d.md_conv[i].cr_count = htole64(md->md_conv[i].cr_count);
 	}
-	le32enc(p, md->md_flags);
-	le32enc(p + 4, md->md_maxopen);
+	d.md_flags = htole32(md->md_flags);
+	d.md_maxopen = htole32(md->md_maxopen);
+	memcpy(data, &d, sizeof(d));
 }
 
 static __inline void
 zoned_metadata_decode(const u_char *data, struct g_zoned_metadata *md)
 {
-	const u_char *p;
+	struct g_zoned_metadata d;
 	u_int i;
 
-	bcopy(data, md->md_magic, sizeof(md->md_magic));
-	md->md_version = le32dec(data + 16);
-	md->md_id = le32dec(data + 20);
-	md->md_zonesize = le64dec(data + 24);
-	md->md_nzones = le32dec(data + 32);
-	md->md_sectorsize = le32dec(data + 36);
-	md->md_provsize = le64dec(data + 40);
-	md->md_nconv = le32dec(data + 48);
-	p = data + 52;
-	for (i = 0; i < G_ZONED_MAXCONV; i++, p += 16) {
-		md->md_conv[i].cr_first = le64dec(p);
-		md->md_conv[i].cr_count = le64dec(p + 8);
+	memcpy(&d, data, sizeof(d));
+	memcpy(md->md_magic, d.md_magic, sizeof(md->md_magic));
+	md->md_version = le32toh(d.md_version);
+	md->md_id = le32toh(d.md_id);
+	md->md_zonesize = le64toh(d.md_zonesize);
+	md->md_nzones = le32toh(d.md_nzones);
+	md->md_sectorsize = le32toh(d.md_sectorsize);
+	md->md_provsize = le64toh(d.md_provsize);
+	md->md_nconv = le32toh(d.md_nconv);
+	md->md_reserved = 0;
+	for (i = 0; i < G_ZONED_MAXCONV; i++) {
+		md->md_conv[i].cr_first = le64toh(d.md_conv[i].cr_first);
+		md->md_conv[i].cr_count = le64toh(d.md_conv[i].cr_count);
 	}
-	md->md_flags = le32dec(p);
-	md->md_maxopen = le32dec(p + 4);
+	md->md_flags = le32toh(d.md_flags);
+	md->md_maxopen = le32toh(d.md_maxopen);
 }
 
 /*
@@ -218,47 +231,53 @@ struct g_zoned_softc {
 static __inline void
 zoned_table_hdr_encode(const struct g_zoned_table_hdr *th, u_char *data)
 {
+	struct g_zoned_table_hdr d;
 
-	bcopy(th->th_magic, data, sizeof(th->th_magic));
-	le32enc(data + 16, th->th_version);
-	le32enc(data + 20, th->th_nzones);
+	memset(&d, 0, sizeof(d));
+	memcpy(d.th_magic, th->th_magic, sizeof(d.th_magic));
+	d.th_version = htole32(th->th_version);
+	d.th_nzones = htole32(th->th_nzones);
+	memcpy(data, &d, sizeof(d));
 }
 
 static __inline void
 zoned_table_hdr_decode(const u_char *data, struct g_zoned_table_hdr *th)
 {
+	struct g_zoned_table_hdr d;
 
-	bcopy(data, th->th_magic, sizeof(th->th_magic));
-	th->th_version = le32dec(data + 16);
-	th->th_nzones = le32dec(data + 20);
+	memcpy(&d, data, sizeof(d));
+	memcpy(th->th_magic, d.th_magic, sizeof(th->th_magic));
+	th->th_version = le32toh(d.th_version);
+	th->th_nzones = le32toh(d.th_nzones);
 }
 
 static __inline void
 g_zoned_entry_encode(const struct disk_zone_rep_entry *z, u_char *data)
 {
-	struct g_zoned_disk_entry *de = (struct g_zoned_disk_entry *)data;
+	struct g_zoned_disk_entry de;
 
-	de->de_type = z->zone_type;
-	de->de_condition = z->zone_condition;
-	de->de_flags = z->zone_flags;
-	de->de_reserved = 0;
-	de->de_write_pointer = htole32(
+	de.de_type = z->zone_type;
+	de.de_condition = z->zone_condition;
+	de.de_flags = z->zone_flags;
+	de.de_reserved = 0;
+	de.de_write_pointer = htole32(
 	    z->write_pointer_lba == G_ZONED_WP_NONE_LBA ? G_ZONED_WP_NONE :
 	    (uint32_t)(z->write_pointer_lba - z->zone_start_lba));
+	memcpy(data, &de, sizeof(de));
 }
 
 static __inline void
 g_zoned_entry_decode(const u_char *data, struct disk_zone_rep_entry *z,
     uint64_t start_lba)
 {
-	const struct g_zoned_disk_entry *de =
-	    (const struct g_zoned_disk_entry *)data;
+	struct g_zoned_disk_entry de;
 	uint32_t wp;
 
-	z->zone_type = de->de_type;
-	z->zone_condition = de->de_condition;
-	z->zone_flags = de->de_flags;
-	wp = le32toh(de->de_write_pointer);
+	memcpy(&de, data, sizeof(de));
+	z->zone_type = de.de_type;
+	z->zone_condition = de.de_condition;
+	z->zone_flags = de.de_flags;
+	wp = le32toh(de.de_write_pointer);
 	z->write_pointer_lba = (wp == G_ZONED_WP_NONE) ? G_ZONED_WP_NONE_LBA :
 	    start_lba + wp;
 }
