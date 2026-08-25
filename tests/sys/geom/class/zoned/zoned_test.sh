@@ -214,6 +214,8 @@ reset_wp_conv_body()
 
 	zoned_backing_md
 	atf_check gzoned create -s 256m -c 0 ${md}
+	atf_check test -c /dev/${md}.zoned
+	atf_check_equal "1" "$(zone_count nonwp)"
 	atf_check -s not-exit:0 -e ignore \
 	    zonectl -d /dev/${md}.zoned -c rwp -l 0
 }
