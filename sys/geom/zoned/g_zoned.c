@@ -1182,6 +1182,7 @@ g_zoned_create(struct g_class *mp, const struct g_zoned_metadata *md,
 	nzones = md->md_nzones;
 	zonesecs = md->md_zonesize / pp->sectorsize;
 	if (nzones == 0 || zonesecs == 0 || zonesecs > G_ZONED_MAXZONESECS ||
+	    (md->md_zonesize % pp->sectorsize) != 0 ||
 	    md->md_nconv > G_ZONED_MAXCONV ||
 	    (md->md_flags & ~G_ZONED_MD_FLAGSMASK) != 0) {
 		G_ZONED_DEBUG(0, "Bogus metadata on %s.", pp->name);
