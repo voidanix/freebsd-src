@@ -982,9 +982,9 @@ g_zoned_write_check(struct g_zoned_softc *sc, struct bio *bp, uint8_t *oldcond)
 
 /*
  * Validate a read against the zone model.  A read may never reach a zone of
- * a different type than the one it starts in, whatever URSWRZ says; only
- * spanning several sequential zones and reading above the write pointer depend
- * on it.
+ * a different type than the one it starts in, nor touch an offline zone,
+ * whatever URSWRZ says; only spanning several sequential zones and reading
+ * above the write pointer depend on it.
  */
 static int
 g_zoned_read_check(struct g_zoned_softc *sc, struct bio *bp)
@@ -1006,8 +1006,14 @@ g_zoned_read_check(struct g_zoned_softc *sc, struct bio *bp)
 	z = &sc->sc_zones[zno];
 	last = (end > lba) ? g_zoned_zoneno(sc, end - 1) : zno;
 
-	for (i = zno + 1; i <= last; i++) {
-		if (sc->sc_zones[i].zone_type != z->zone_type) {
+	for (i = zno; i <= last; i++) {
+		if (sc->sc_zones[i].zone_condition == DISK_ZONE_COND_OFFLINE) {
+			G_ZONED_LOGREQLVL(1, bp, "Read from an offline zone.");
+			return (G_ZONED_EXTERR(bp, EIO,
+			    "Read from an offline zone.  zone=%ju",
+			    (uint64_t)i));
+		}
+		if (i > zno && sc->sc_zones[i].zone_type != z->zone_type) {
 			G_ZONED_LOGREQLVL(1, bp, "Read crosses into a zone of "
 			    "a different type.");
 			return (G_ZONED_EXTERR(bp, EIO,

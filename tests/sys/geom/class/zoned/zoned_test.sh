@@ -726,6 +726,13 @@ fault_injection_body()
 
 	atf_check gzoned fault -z 2 -s offline ${md}.zoned
 	atf_check_equal "1" "$(zone_count offline)"
+	# A read only zone stays readable; an offline one does not.
+	atf_check gzoned fault -z 1 -s ro ${md}.zoned
+	atf_check -e ignore \
+	    dd if=/dev/${md}.zoned of=/dev/null bs=1m iseek=256 count=1
+	atf_check -s not-exit:0 -e ignore \
+	    dd if=/dev/${md}.zoned of=/dev/null bs=1m iseek=512 count=1
+	atf_check gzoned fault -z 1 -s clear ${md}.zoned
 	atf_check gzoned fault -z 3 -s reset ${md}.zoned
 	atf_check_equal "1" "$(zone_count reset)"
 }
