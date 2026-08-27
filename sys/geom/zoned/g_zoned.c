@@ -1179,7 +1179,7 @@ g_zoned_create(struct g_class *mp, const struct g_zoned_metadata *md,
 
 	g_topology_assert();
 
-	nzones = md->md_nzones;
+	nzones = g_zoned_nzones(pp->mediasize, md->md_zonesize, pp->sectorsize);
 	zonesecs = md->md_zonesize / pp->sectorsize;
 	if (nzones == 0 || zonesecs == 0 || zonesecs > G_ZONED_MAXZONESECS ||
 	    (md->md_zonesize % pp->sectorsize) != 0 ||
@@ -1340,8 +1340,6 @@ g_zoned_taste(struct g_class *mp, struct g_provider *pp, int flags __unused)
 	if (md.md_provsize != (uint64_t)pp->mediasize)
 		return (NULL);
 	if (md.md_sectorsize != pp->sectorsize)
-		return (NULL);
-	if (md.md_nzones == 0 || md.md_zonesize == 0)
 		return (NULL);
 
 	/* Already running? */

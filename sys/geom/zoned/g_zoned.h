@@ -93,19 +93,16 @@ struct g_zoned_metadata {
 	uint32_t	md_version;	/* Version number. */
 	uint32_t	md_id;		/* Unique ID. */
 	uint64_t	md_zonesize;	/* Zone size in bytes. */
-	uint32_t	md_nzones;	/* Number of zones. */
 	uint32_t	md_sectorsize;	/* Provider sector size in bytes. */
-	uint64_t	md_provsize;	/* Provider size in bytes. */
 	uint32_t	md_nconv;	/* Conventional ranges in use. */
-	/* Pads md_conv to the alignment its 64-bit members already need. */
-	uint32_t	md_reserved;
+	uint64_t	md_provsize;	/* Provider size in bytes. */
 	struct g_zoned_convrange md_conv[G_ZONED_MAXCONV];
 	uint32_t	md_flags;	/* G_ZONED_MD_* flags. */
 	uint32_t	md_maxopen;	/* Open zone limit, 0 = unlimited. */
 };
-_Static_assert(sizeof(struct g_zoned_metadata) == 320,
+_Static_assert(sizeof(struct g_zoned_metadata) == 312,
     "on-disk metadata layout changed");
-_Static_assert(__offsetof(struct g_zoned_metadata, md_conv) == 56,
+_Static_assert(__offsetof(struct g_zoned_metadata, md_conv) == 48,
     "on-disk metadata layout changed");
 
 /*
@@ -124,10 +121,9 @@ zoned_metadata_encode(const struct g_zoned_metadata *md, u_char *data)
 	d.md_version = htole32(md->md_version);
 	d.md_id = htole32(md->md_id);
 	d.md_zonesize = htole64(md->md_zonesize);
-	d.md_nzones = htole32(md->md_nzones);
 	d.md_sectorsize = htole32(md->md_sectorsize);
-	d.md_provsize = htole64(md->md_provsize);
 	d.md_nconv = htole32(md->md_nconv);
+	d.md_provsize = htole64(md->md_provsize);
 	for (i = 0; i < G_ZONED_MAXCONV; i++) {
 		d.md_conv[i].cr_first = htole64(md->md_conv[i].cr_first);
 		d.md_conv[i].cr_count = htole64(md->md_conv[i].cr_count);
@@ -148,11 +144,9 @@ zoned_metadata_decode(const u_char *data, struct g_zoned_metadata *md)
 	md->md_version = le32toh(d.md_version);
 	md->md_id = le32toh(d.md_id);
 	md->md_zonesize = le64toh(d.md_zonesize);
-	md->md_nzones = le32toh(d.md_nzones);
 	md->md_sectorsize = le32toh(d.md_sectorsize);
-	md->md_provsize = le64toh(d.md_provsize);
 	md->md_nconv = le32toh(d.md_nconv);
-	md->md_reserved = 0;
+	md->md_provsize = le64toh(d.md_provsize);
 	for (i = 0; i < G_ZONED_MAXCONV; i++) {
 		md->md_conv[i].cr_first = le64toh(d.md_conv[i].cr_first);
 		md->md_conv[i].cr_count = le64toh(d.md_conv[i].cr_count);

@@ -174,6 +174,35 @@ zone_size_cleanup()
 	gzoned_test_cleanup
 }
 
+atf_test_case zone_count_derived cleanup
+zone_count_derived_head()
+{
+	atf_set "descr" "gzoned obtains the same zone count at every taste"
+	atf_set "require.user" "root"
+}
+zone_count_derived_body()
+{
+	gzoned_test_setup
+
+	zoned_backing_md
+	atf_check gzoned create -s 128m ${md}
+	atf_check -o match:"^8 zones," \
+	    zonectl -d /dev/${md}.zoned -c rz -P summary
+	last_start=$(zone_start 7)
+
+	atf_check gzoned stop ${md}.zoned
+	wait_dev_gone /dev/${md}.zoned
+	true > /dev/${md}
+	wait_dev /dev/${md}.zoned
+	atf_check -o match:"^8 zones," \
+	    zonectl -d /dev/${md}.zoned -c rz -P summary
+	atf_check_equal "${last_start}" "$(zone_start 7)"
+}
+zone_count_derived_cleanup()
+{
+	gzoned_test_cleanup
+}
+
 atf_test_case reset_wp cleanup
 reset_wp_head()
 {
@@ -837,6 +866,7 @@ atf_init_test_cases()
 	atf_add_test_case conventional_overlap
 	atf_add_test_case all_zones_same
 	atf_add_test_case zone_size
+	atf_add_test_case zone_count_derived
 	atf_add_test_case reset_wp
 	atf_add_test_case reset_wp_conv
 	atf_add_test_case reset_wp_empty

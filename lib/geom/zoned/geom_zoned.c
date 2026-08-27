@@ -235,7 +235,6 @@ zoned_create(struct gctl_req *req)
 	md.md_version = G_ZONED_VERSION;
 	md.md_id = arc4random();
 	md.md_zonesize = zonesize;
-	md.md_nzones = nzones;
 	md.md_sectorsize = secsize;
 	md.md_provsize = msize;
 	md.md_maxopen = (uint32_t)maxopen;
